@@ -14,6 +14,12 @@
 // backup_info.json is verified to be a valid pre-transform object and then
 // copied over the info.json key (restoring the true original in place),
 // after which the backup_info.json is deleted.
+//
+// Run with -all to ignore collection_identifier and instead process every
+// Collection record in collection_table whose "visible" attribute is true,
+// one after another; a failure in one collection doesn't stop the rest from
+// being attempted, and the process exits non-zero if any collection had a
+// failure.
 package main
 
 import (
@@ -95,9 +101,8 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.ArchiveTable == "" {
 		missing = append(missing, "archive_table")
 	}
-	if cfg.CollectionIdentifier == "" {
-		missing = append(missing, "collection_identifier")
-	}
+	// collection_identifier is required unless -all is passed (checked in
+	// main, which knows about CLI flags); loadConfig doesn't enforce it.
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("config file is missing required field(s): %s", strings.Join(missing, ", "))
 	}
@@ -323,6 +328,54 @@ func findCollectionID(ctx context.Context, client *dynamodb.Client, collectionTa
 	return idAttr.Value, nil
 }
 
+// collectionTarget identifies a single collection to process: its
+// DynamoDB id (used to look up archives) and its identifier (used as the
+// S3 collection-root path segment).
+type collectionTarget struct {
+	id         string
+	identifier string
+}
+
+// findVisibleCollections scans collectionTable for every item whose
+// "visible" attribute is boolean true, and returns each match's "id" and
+// "identifier" attribute values as a collectionTarget. Used by -all to
+// process every visible collection instead of a single configured one.
+// Items missing a valid string "id" or "identifier" are skipped with a
+// logged warning rather than aborting the whole run.
+func findVisibleCollections(ctx context.Context, client *dynamodb.Client, collectionTable string) ([]collectionTarget, error) {
+	var targets []collectionTarget
+
+	paginator := dynamodb.NewScanPaginator(client, &dynamodb.ScanInput{
+		TableName:        aws.String(collectionTable),
+		FilterExpression: aws.String("visible = :visible"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":visible": &types.AttributeValueMemberBOOL{Value: true},
+		},
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("scanning collection table %q: %w", collectionTable, err)
+		}
+		for _, item := range page.Items {
+			idAttr, ok := item["id"].(*types.AttributeValueMemberS)
+			if !ok || idAttr.Value == "" {
+				log.Printf("WARNING: visible collection record in table %q is missing a string \"id\" field, skipping", collectionTable)
+				continue
+			}
+			identifierAttr, ok := item["identifier"].(*types.AttributeValueMemberS)
+			if !ok || identifierAttr.Value == "" {
+				log.Printf("WARNING: visible collection record (id=%q) in table %q is missing a string \"identifier\" field, skipping", idAttr.Value, collectionTable)
+				continue
+			}
+			targets = append(targets, collectionTarget{id: idAttr.Value, identifier: identifierAttr.Value})
+		}
+	}
+
+	return targets, nil
+}
+
 // findArchiveIdentifiers scans archiveTable for every item whose
 // "collection" attribute equals collectionID and returns the deduplicated
 // set of matching items' "identifier" attribute values. Items missing a
@@ -490,11 +543,15 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "path to YAML config file")
 	dryRunFlag := flag.Bool("dry-run", false, "force dry-run mode (scan and report only, no writes); overrides dry_run: false in the config file")
 	rollback := flag.Bool("rollback", false, "reverse mode: convert each discovered info.json from the corrected/output format back to the original input format, then delete its backup_info.json")
+	all := flag.Bool("all", false, "ignore collection_identifier and process every Collection record in collection_table where visible=true")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("config error: %v", err)
+	}
+	if !*all && cfg.CollectionIdentifier == "" {
+		log.Fatalf("config error: collection_identifier is required unless -all is passed")
 	}
 
 	dryRun := cfg.DryRun || *dryRunFlag
@@ -514,35 +571,61 @@ func main() {
 	if *rollback {
 		mode = "ROLLBACK " + mode
 	}
-	collectionRootPrefix := cfg.CollectionPrefix + cfg.CollectionIdentifier + "/"
-	tilesPrefix := collectionRootPrefix + cfg.TilesDirName + "/"
+	log.Printf("bucket=%s info_file_name=%s backup_file_name=%s concurrency=%d mode=%s",
+		cfg.Bucket, cfg.InfoFileName, cfg.BackupFileName, cfg.Concurrency, mode)
 
-	log.Printf("bucket=%s tiles_prefix=%s info_file_name=%s backup_file_name=%s concurrency=%d mode=%s",
-		cfg.Bucket, tilesPrefix, cfg.InfoFileName, cfg.BackupFileName, cfg.Concurrency, mode)
-
-	collectionID, err := findCollectionID(ctx, ddbClient, cfg.CollectionTable, cfg.CollectionIdentifier)
-	if err != nil {
-		log.Fatalf("%v", err)
+	var targets []collectionTarget
+	if *all {
+		targets, err = findVisibleCollections(ctx, ddbClient, cfg.CollectionTable)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		log.Printf("found %d visible collection(s) in table %s", len(targets), cfg.CollectionTable)
+	} else {
+		collectionID, err := findCollectionID(ctx, ddbClient, cfg.CollectionTable, cfg.CollectionIdentifier)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		log.Printf("found collection id=%s for collection_identifier=%s in table %s", collectionID, cfg.CollectionIdentifier, cfg.CollectionTable)
+		targets = []collectionTarget{{id: collectionID, identifier: cfg.CollectionIdentifier}}
 	}
-	log.Printf("found collection id=%s for collection_identifier=%s in table %s", collectionID, cfg.CollectionIdentifier, cfg.CollectionTable)
 
-	archiveIdentifiers, err := findArchiveIdentifiers(ctx, ddbClient, cfg.ArchiveTable, collectionID)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
-	log.Printf("found %d archive identifier(s) in table %s for collection id=%s", len(archiveIdentifiers), cfg.ArchiveTable, collectionID)
+	var totalFailed int
+	for _, target := range targets {
+		collectionRootPrefix := cfg.CollectionPrefix + target.identifier + "/"
+		tilesPrefix := collectionRootPrefix + cfg.TilesDirName + "/"
 
-	infoKeys, err := findInfoObjects(ctx, client, cfg.Bucket, tilesPrefix, cfg.InfoFileName, archiveIdentifiers, cfg.Concurrency)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
-	log.Printf("found %d %s object(s) under %s<archive_identifier>-<index>/", len(infoKeys), cfg.InfoFileName, tilesPrefix)
+		log.Printf("--- collection identifier=%s id=%s tiles_prefix=%s ---", target.identifier, target.id, tilesPrefix)
 
-	if *rollback {
-		runRollback(ctx, client, cfg, infoKeys, dryRun)
-		return
+		archiveIdentifiers, err := findArchiveIdentifiers(ctx, ddbClient, cfg.ArchiveTable, target.id)
+		if err != nil {
+			log.Printf("ERROR %v", err)
+			totalFailed++
+			continue
+		}
+		log.Printf("found %d archive identifier(s) in table %s for collection id=%s", len(archiveIdentifiers), cfg.ArchiveTable, target.id)
+
+		infoKeys, err := findInfoObjects(ctx, client, cfg.Bucket, tilesPrefix, cfg.InfoFileName, archiveIdentifiers, cfg.Concurrency)
+		if err != nil {
+			log.Printf("ERROR %v", err)
+			totalFailed++
+			continue
+		}
+		log.Printf("found %d %s object(s) under %s<archive_identifier>-<index>/", len(infoKeys), cfg.InfoFileName, tilesPrefix)
+
+		if *rollback {
+			totalFailed += runRollback(ctx, client, cfg, infoKeys, dryRun)
+		} else {
+			totalFailed += runTransform(ctx, client, cfg, infoKeys, dryRun)
+		}
 	}
-	runTransform(ctx, client, cfg, infoKeys, dryRun)
+
+	if len(targets) > 1 {
+		log.Printf("all done: collections=%d total_failed=%d", len(targets), totalFailed)
+	}
+	if totalFailed > 0 {
+		os.Exit(1)
+	}
 }
 
 // pendingTransform is an info.json object confirmed (by isAlreadyTransformed)
@@ -559,8 +642,10 @@ type pendingTransform struct {
 // forward mode of operation). Objects already in the corrected format are
 // skipped entirely — neither backed up nor rewritten — so that running the
 // tool again over an already-processed collection can't overwrite a
-// backup_info.json with already-corrected content.
-func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys []string, dryRun bool) {
+// backup_info.json with already-corrected content. Returns the number of
+// keys that failed, so the caller can aggregate failures across multiple
+// collections (-all) instead of exiting immediately.
+func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys []string, dryRun bool) int {
 	// Phase 1: download and classify each key concurrently.
 	type classifyResult struct {
 		err     error
@@ -639,8 +724,9 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 	failed += backupFailed
 
 	if backupFailed > 0 {
-		log.Printf("aborting before modification step: %d backup(s) failed", backupFailed)
-		os.Exit(1)
+		log.Printf("aborting modification step for this collection: %d backup(s) failed", backupFailed)
+		log.Printf("done: found=%d skipped=%d backed_up=%d modified=0 failed=%d", len(infoKeys), skipped, backedUp, failed)
+		return failed
 	}
 
 	// Phase 3: transform and upload every pending item concurrently.
@@ -686,17 +772,17 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 		log.Printf("done: found=%d skipped=%d backed_up=%d modified=%d failed=%d", len(infoKeys), skipped, backedUp, modified, failed)
 	}
 
-	if failed > 0 {
-		os.Exit(1)
-	}
+	return failed
 }
 
 // runRollback restores each object in infoKeys from its backup_info.json:
 // after confirming the backup is a valid pre-transform object
 // (isPreTransformShape), it copies backupKey over infoKey (a server-side
 // S3 "move" of the true original, rather than reconstructing one from
-// hardcoded field values) and then deletes backupKey.
-func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys []string, dryRun bool) {
+// hardcoded field values) and then deletes backupKey. Returns the number
+// of keys that failed, so the caller can aggregate failures across
+// multiple collections (-all) instead of exiting immediately.
+func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys []string, dryRun bool) int {
 	type rollbackResult struct {
 		err        error
 		dryRunNote string
@@ -764,7 +850,5 @@ func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys [
 		log.Printf("done: found=%d rolled_back=%d failed=%d", len(infoKeys), rolledBack, failed)
 	}
 
-	if failed > 0 {
-		os.Exit(1)
-	}
+	return failed
 }

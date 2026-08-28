@@ -26,7 +26,8 @@ archive_table: < your Archive table name >
 # Value to look up in collection_table's "identifier" attribute to find this
 # collection. Also used as the final path segment of the collection root on
 # S3: the collection root is collection_prefix + "/" + collection_identifier
-# + "/".
+# + "/". Ignored (and not required) when running with the -all CLI flag,
+# which processes every Collection record with visible=true instead.
 collection_identifier: mycollection
 
 # Name of the info.json file to look for within each item's tile directory.

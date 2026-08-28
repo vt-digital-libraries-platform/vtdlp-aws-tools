@@ -42,8 +42,9 @@ For a configured bucket, collection, and pair of DynamoDB tables, the tool:
 
 3. **Backs up** every remaining (still-original-format) `info.json`, as a
    server-side S3 copy named `backup_info.json` (configurable) at the same
-   key location. If any backup fails, the run aborts before modifying
-   anything.
+   key location. If any backup fails, that collection's modification step
+   is aborted (nothing is rewritten for it), without stopping other
+   collections when running with `-all`.
 
 4. **Rewrites** each backed-up `info.json` in place (same bucket, same key)
    to the corrected format — see [Transform](#transform) below.
@@ -52,6 +53,9 @@ Run with `-dry-run` (or `dry_run: true` in the config) to see exactly what
 would be backed up and rewritten without touching S3.
 
 Run with `-rollback` to reverse this instead — see [Rollback](#rollback).
+
+Run with `-all` to process every visible collection instead of one — see
+[Processing every collection](#processing-every-collection).
 
 ## Transform
 
@@ -146,6 +150,36 @@ See `runRollback` and `isPreTransformShape` in [`main.go`](main.go).
 shape check accepts `incorrect_info.json` (pre-transform) and rejects
 `corrected_info.json` (post-transform).
 
+## Processing every collection
+
+Run with `-all` to ignore `collection_identifier` and instead process
+every Collection record in `collection_table` whose `visible` attribute is
+`true`: for each one (identified by its own `identifier` and `id`
+attributes), the tool runs the same discovery → skip/backup/transform (or
+`-rollback`) flow described above, using that collection's `identifier` as
+the S3 path segment (`collection_prefix` + `/` + `identifier` + `/`).
+
+Collections are processed one after another (each collection's own
+per-key work is still concurrent, per [Concurrency](#concurrency) below).
+A failure discovering or processing one collection is logged and counted,
+but doesn't stop the rest from being attempted — the process exits
+non-zero at the end if any collection had a failure. With more than one
+collection found, a final `all done: collections=N total_failed=N` line
+is logged after every collection has been attempted.
+
+```sh
+# Dry run first:
+./iiif-infoFile-modifier -config config.yaml -all -dry-run
+
+# Live, every visible collection:
+./iiif-infoFile-modifier -config config.yaml -all
+
+# Roll back every visible collection:
+./iiif-infoFile-modifier -config config.yaml -all -rollback
+```
+
+See `findVisibleCollections` in [`main.go`](main.go).
+
 ## Configuration
 
 Config is a YAML file, passed with `-config` (defaults to `config.yaml` in
@@ -159,7 +193,7 @@ with comments.
 | `collection_prefix` | yes | — | Key prefix *above* the collection root (trailing slash optional; added automatically). `collection_identifier` supplies the final path segment. |
 | `collection_table` | yes | — | DynamoDB table holding Collection records; looked up by `identifier` to find the collection's `id`. |
 | `archive_table` | yes | — | DynamoDB table holding Archive records; scanned for `collection` matching the collection's `id` to find archive identifiers. |
-| `collection_identifier` | yes | — | Value matched against `collection_table`'s `identifier` attribute. Also the final path segment of the S3 collection root: `collection_prefix` + `/` + `collection_identifier` + `/`. |
+| `collection_identifier` | yes, unless `-all` | — | Value matched against `collection_table`'s `identifier` attribute. Also the final path segment of the S3 collection root: `collection_prefix` + `/` + `collection_identifier` + `/`. Ignored when `-all` is passed. |
 | `tiles_dir_name` | no | `tiles` | Directory directly under the collection root (`collection_prefix`/`collection_identifier`) holding one subdirectory per archive's tiles. |
 | `info_file_name` | no | `info.json` | Filename to look for inside each archive's tile directory. |
 | `backup_file_name` | no | `backup_info.json` | Filename for the pre-modification backup, written alongside each `info.json`. |
@@ -197,8 +231,10 @@ Flags:
   (`dry_run: true` in the config cannot be overridden back to live via
   flags — edit the file instead.)
 - `-rollback` — reverse mode; see [Rollback](#rollback).
+- `-all` — process every visible collection instead of one; see
+  [Processing every collection](#processing-every-collection).
 
-The process logs a summary line at the end. Normal mode:
+The process logs a summary line per collection. Normal mode:
 
 ```
 done: found=42 skipped=0 backed_up=42 modified=42 failed=0
@@ -210,8 +246,16 @@ Rollback mode:
 done: found=42 rolled_back=42 failed=0
 ```
 
-and exits non-zero if any object failed to back up/download/transform/upload
-(normal mode) or download/rollback/upload/delete (rollback mode).
+With `-all` and more than one collection found, a final line follows once
+every collection has been attempted:
+
+```
+all done: collections=5 total_failed=0
+```
+
+and the process exits non-zero if any object failed to back up/download/
+transform/upload (normal mode) or download/rollback/upload/delete
+(rollback mode), in any collection processed.
 
 ## AWS credentials & permissions
 
