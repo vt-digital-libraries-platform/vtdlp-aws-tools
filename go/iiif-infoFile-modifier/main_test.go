@@ -81,6 +81,33 @@ func TestIsAlreadyTransformed(t *testing.T) {
 	}
 }
 
+func TestLooksLikeIIIFInfoJSON(t *testing.T) {
+	original, err := os.ReadFile("incorrect_info.json")
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+	corrected, err := os.ReadFile("corrected_info.json")
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+
+	if !looksLikeIIIFInfoJSON(original) {
+		t.Errorf("looksLikeIIIFInfoJSON(original) = false, want true")
+	}
+	if !looksLikeIIIFInfoJSON(corrected) {
+		t.Errorf("looksLikeIIIFInfoJSON(corrected) = false, want true")
+	}
+
+	nonIIIF := []byte(`{"format": "mp4", "duration_seconds": 120, "width": 1920, "height": 1080}`)
+	if looksLikeIIIFInfoJSON(nonIIIF) {
+		t.Errorf("looksLikeIIIFInfoJSON(nonIIIF) = true, want false")
+	}
+
+	if looksLikeIIIFInfoJSON([]byte(`not json`)) {
+		t.Errorf("looksLikeIIIFInfoJSON(invalid JSON) = true, want false")
+	}
+}
+
 func TestTransformInfoJSON_Idempotent(t *testing.T) {
 	in, err := os.ReadFile("corrected_info.json")
 	if err != nil {

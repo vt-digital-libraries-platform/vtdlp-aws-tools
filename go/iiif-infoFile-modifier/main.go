@@ -20,6 +20,15 @@
 // one after another; a failure in one collection doesn't stop the rest from
 // being attempted, and the process exits non-zero if any collection had a
 // failure.
+//
+// Every discovered info.json is individually checked for the
+// "@context"/"protocol" fields every IIIF "tiles/" info.json declares.
+// Some collections are built from non-IIIF media and may have an
+// unrelated file literally named "info.json" at the expected path — even
+// mixed in among IIIF records within the same collection; any key that
+// doesn't look like IIIF is skipped untouched (not counted as a failure)
+// instead of being blindly transformed, and the rest of the collection is
+// still processed normally.
 package main
 
 import (
@@ -258,6 +267,28 @@ func isPreTransformShape(data []byte) (bool, error) {
 
 	_, hasFormats := extra["formats"]
 	return !hasFormats, nil
+}
+
+// looksLikeIIIFInfoJSON reports whether data has the top-level "@context"
+// and "protocol" fields every "tiles/" info.json declares in both the
+// tool's pre-transform and corrected shapes. Some collections are built
+// from non-IIIF media (e.g. video) and may still place a file literally
+// named "info.json" at the expected path with a completely different
+// shape; since transformInfoJSON/isAlreadyTransformed tolerate arbitrary
+// JSON without erroring (unmarshaling into a struct silently zero-fills
+// missing fields), this check is what lets the tool recognize such a
+// record and skip it (in runTransform's classify phase, and in
+// runRollback before ever looking for its backup) rather than
+// "transforming" unrelated data into garbage.
+func looksLikeIIIFInfoJSON(data []byte) bool {
+	var probe struct {
+		Context  string `json:"@context"`
+		Protocol string `json:"protocol"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	return probe.Context == requiredContext && probe.Protocol == requiredProtocol
 }
 
 // runConcurrent calls fn(i) once for every i in [0, n), running up to
@@ -649,6 +680,7 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 	// Phase 1: download and classify each key concurrently.
 	type classifyResult struct {
 		err     error
+		nonIIIF bool
 		skip    bool
 		pending pendingTransform
 	}
@@ -658,6 +690,11 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 		data, err := downloadObject(ctx, client, cfg.Bucket, infoKey)
 		if err != nil {
 			classified[i] = classifyResult{err: fmt.Errorf("downloading %q: %w", infoKey, err)}
+			return
+		}
+
+		if !looksLikeIIIFInfoJSON(data) {
+			classified[i] = classifyResult{nonIIIF: true}
 			return
 		}
 
@@ -679,12 +716,15 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 	})
 
 	var toProcess []pendingTransform
-	var skipped, failed int
+	var skipped, skippedNonIIIF, failed int
 	for i, r := range classified {
 		switch {
 		case r.err != nil:
 			failed++
 			log.Printf("ERROR %v", r.err)
+		case r.nonIIIF:
+			skippedNonIIIF++
+			log.Printf("skipping %q: does not look like an IIIF info.json, leaving untouched", infoKeys[i])
 		case r.skip:
 			skipped++
 			log.Printf("skipping %q: already in corrected format, leaving its backup untouched", infoKeys[i])
@@ -725,7 +765,7 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 
 	if backupFailed > 0 {
 		log.Printf("aborting modification step for this collection: %d backup(s) failed", backupFailed)
-		log.Printf("done: found=%d skipped=%d backed_up=%d modified=0 failed=%d", len(infoKeys), skipped, backedUp, failed)
+		log.Printf("done: found=%d skipped=%d non_iiif=%d backed_up=%d modified=0 failed=%d", len(infoKeys), skipped, skippedNonIIIF, backedUp, failed)
 		return failed
 	}
 
@@ -767,24 +807,26 @@ func runTransform(ctx context.Context, client *s3.Client, cfg *Config, infoKeys 
 	}
 
 	if dryRun {
-		log.Printf("done: found=%d skipped=%d (dry run, nothing written)", len(infoKeys), skipped)
+		log.Printf("done: found=%d skipped=%d non_iiif=%d (dry run, nothing written)", len(infoKeys), skipped, skippedNonIIIF)
 	} else {
-		log.Printf("done: found=%d skipped=%d backed_up=%d modified=%d failed=%d", len(infoKeys), skipped, backedUp, modified, failed)
+		log.Printf("done: found=%d skipped=%d non_iiif=%d backed_up=%d modified=%d failed=%d", len(infoKeys), skipped, skippedNonIIIF, backedUp, modified, failed)
 	}
 
 	return failed
 }
 
 // runRollback restores each object in infoKeys from its backup_info.json:
-// after confirming the backup is a valid pre-transform object
-// (isPreTransformShape), it copies backupKey over infoKey (a server-side
-// S3 "move" of the true original, rather than reconstructing one from
-// hardcoded field values) and then deletes backupKey. Returns the number
-// of keys that failed, so the caller can aggregate failures across
-// multiple collections (-all) instead of exiting immediately.
+// after confirming infoKey itself looks like an IIIF info.json and its
+// backup is a valid pre-transform object (isPreTransformShape), it copies
+// backupKey over infoKey (a server-side S3 "move" of the true original,
+// rather than reconstructing one from hardcoded field values) and then
+// deletes backupKey. Returns the number of keys that failed, so the
+// caller can aggregate failures across multiple collections (-all)
+// instead of exiting immediately.
 func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys []string, dryRun bool) int {
 	type rollbackResult struct {
 		err        error
+		nonIIIF    bool
 		dryRunNote string
 		restored   bool
 	}
@@ -793,6 +835,22 @@ func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys [
 	runConcurrent(len(infoKeys), cfg.Concurrency, func(i int) {
 		infoKey := infoKeys[i]
 		backupKey := backupKeyFor(infoKey, cfg.InfoFileName, cfg.BackupFileName)
+
+		// Some collections are built from non-IIIF media and may have an
+		// unrelated file literally named info.json at this path; such a
+		// record was never backed up by a forward run (isAlreadyTransformed
+		// classification skips it), so check infoKey itself before ever
+		// touching backupKey, rather than treating a missing backup as an
+		// error.
+		currentData, err := downloadObject(ctx, client, cfg.Bucket, infoKey)
+		if err != nil {
+			results[i] = rollbackResult{err: fmt.Errorf("downloading %q: %w", infoKey, err)}
+			return
+		}
+		if !looksLikeIIIFInfoJSON(currentData) {
+			results[i] = rollbackResult{nonIIIF: true}
+			return
+		}
 
 		backupData, err := downloadObject(ctx, client, cfg.Bucket, backupKey)
 		if err != nil {
@@ -828,7 +886,7 @@ func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys [
 		results[i] = rollbackResult{restored: true}
 	})
 
-	var rolledBack, failed int
+	var rolledBack, skippedNonIIIF, failed int
 	for i, r := range results {
 		infoKey := infoKeys[i]
 		backupKey := backupKeyFor(infoKey, cfg.InfoFileName, cfg.BackupFileName)
@@ -836,6 +894,9 @@ func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys [
 		case r.err != nil:
 			failed++
 			log.Printf("ERROR %v", r.err)
+		case r.nonIIIF:
+			skippedNonIIIF++
+			log.Printf("skipping %q: does not look like an IIIF info.json, leaving untouched", infoKey)
 		case r.dryRunNote != "":
 			log.Print(r.dryRunNote)
 		case r.restored:
@@ -845,9 +906,9 @@ func runRollback(ctx context.Context, client *s3.Client, cfg *Config, infoKeys [
 	}
 
 	if dryRun {
-		log.Printf("done: found=%d (dry run, nothing written)", len(infoKeys))
+		log.Printf("done: found=%d non_iiif=%d (dry run, nothing written)", len(infoKeys), skippedNonIIIF)
 	} else {
-		log.Printf("done: found=%d rolled_back=%d failed=%d", len(infoKeys), rolledBack, failed)
+		log.Printf("done: found=%d rolled_back=%d non_iiif=%d failed=%d", len(infoKeys), rolledBack, skippedNonIIIF, failed)
 	}
 
 	return failed
