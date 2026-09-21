@@ -14,8 +14,14 @@ input_file: ~/Desktop/duplicate_titles_dev.json
 item_category: federated
 
 # Optional. Only records whose parent_collection_identifier (as listed in the
-# input report) equals this value are modified. Leave empty for no filtering.
+# input report) equals this value are modified. If a record has no parent
+# collection, the identifier of its own collection is looked up in
+# collection_table_name and compared instead. Leave empty for no filtering.
 collection_identifier: iawa
+
+# Collection table, queried for the identifier when a record has no
+# parent_collection_identifier. Required when collection_identifier is set.
+collection_table_name: Collection-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
 
 # Text appended to the title. Each modified record then gets "-<index>"
 # after it, where index is 1-based within its duplicate-title group.

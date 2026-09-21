@@ -27,9 +27,13 @@ type Config struct {
 	// CollectionIdentifier, if set, restricts changes to records whose
 	// parent_collection_identifier in the report equals it.
 	CollectionIdentifier string `yaml:"collection_identifier"`
-	Suffix               string `yaml:"suffix"`
-	Concurrency          int    `yaml:"concurrency"`
-	DryRun               bool   `yaml:"dry_run"`
+	// CollectionTableName is queried for the collection's own identifier when
+	// a record has no parent_collection_identifier. Required when
+	// collection_identifier is set.
+	CollectionTableName string `yaml:"collection_table_name"`
+	Suffix              string `yaml:"suffix"`
+	Concurrency         int    `yaml:"concurrency"`
+	DryRun              bool   `yaml:"dry_run"`
 }
 
 type Report struct {
@@ -43,6 +47,7 @@ type Group struct {
 
 type Record struct {
 	Identifier                 string  `json:"identifier"`
+	CollectionID               string  `json:"collection_id"`
 	ItemCategory               string  `json:"item_category"`
 	ParentCollectionIdentifier *string `json:"parent_collection_identifier"`
 }
@@ -81,6 +86,9 @@ func loadConfig(path string) (*Config, error) {
 	case c.Suffix == "":
 		return nil, errors.New("suffix is required")
 	}
+	if c.CollectionIdentifier != "" && c.CollectionTableName == "" {
+		return nil, errors.New("collection_table_name is required when collection_identifier is set")
+	}
 	if c.Region == "" {
 		c.Region = "us-east-1"
 	}
@@ -94,7 +102,10 @@ func loadConfig(path string) (*Config, error) {
 // plan builds the list of title changes: every record in a duplicate group
 // whose item_category matches gets "<title><suffix>-<n>", n starting at 1
 // within the group.
-func plan(cfg *Config) ([]job, error) {
+//
+// lookup returns the identifier of the Collection row with the given id; it is
+// used when a record has no parent_collection_identifier.
+func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job, error) {
 	data, err := os.ReadFile(cfg.InputFile)
 	if err != nil {
 		return nil, err
@@ -110,9 +121,20 @@ func plan(cfg *Config) ([]job, error) {
 			if r.ItemCategory != cfg.ItemCategory {
 				continue
 			}
-			if cfg.CollectionIdentifier != "" &&
-				(r.ParentCollectionIdentifier == nil || *r.ParentCollectionIdentifier != cfg.CollectionIdentifier) {
-				continue
+			if cfg.CollectionIdentifier != "" {
+				var want string
+				if r.ParentCollectionIdentifier != nil {
+					want = *r.ParentCollectionIdentifier
+				} else if r.CollectionID != "" {
+					id, err := lookup(r.CollectionID)
+					if err != nil {
+						return nil, fmt.Errorf("collection %s (record %s): %w", r.CollectionID, r.Identifier, err)
+					}
+					want = id
+				}
+				if want != cfg.CollectionIdentifier {
+					continue
+				}
 			}
 			n++
 			jobs = append(jobs, job{
@@ -164,13 +186,6 @@ func main() {
 		cfg.DryRun = true
 	}
 
-	jobs, err := plan(cfg)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "input:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("table=%s category=%q parent_collection=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, cfg.CollectionIdentifier, len(jobs), cfg.DryRun)
-
 	ctx := context.Background()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 	if err != nil {
@@ -178,6 +193,35 @@ func main() {
 		os.Exit(1)
 	}
 	db := dynamodb.NewFromConfig(awsCfg)
+
+	cache := map[string]string{}
+	lookup := func(collectionID string) (string, error) {
+		if v, ok := cache[collectionID]; ok {
+			return v, nil
+		}
+		out, err := db.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:                aws.String(cfg.CollectionTableName),
+			Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: collectionID}},
+			ProjectionExpression:     aws.String("#i"),
+			ExpressionAttributeNames: map[string]string{"#i": "identifier"},
+		})
+		if err != nil {
+			return "", err
+		}
+		v := ""
+		if s, ok := out.Item["identifier"].(*types.AttributeValueMemberS); ok {
+			v = s.Value
+		}
+		cache[collectionID] = v
+		return v, nil
+	}
+
+	jobs, err := plan(cfg, lookup)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("table=%s category=%q collection_identifier=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, cfg.CollectionIdentifier, len(jobs), cfg.DryRun)
 
 	ids, err := idsByIdentifier(ctx, db, cfg.TableName)
 	if err != nil {
