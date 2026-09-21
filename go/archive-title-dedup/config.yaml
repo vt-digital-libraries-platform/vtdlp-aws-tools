@@ -37,8 +37,10 @@ change_log: title-changes.jsonl
 
 # Restore original titles from change_log instead of applying changes. Also
 # enabled by the -rollback flag. Only rows whose title is still the value this
-# tool set are restored. item_category, suffix etc. are ignored in this mode.
-rollback: false
+# tool set are restored. If change_log does not exist, the original titles are
+# taken from input_file, using the same item_category, collection_identifier and
+# suffix settings that were used to apply the changes.
+rollback: true
 
 # Report planned changes without writing. Also forced by the -dry-run flag.
 dry_run: false

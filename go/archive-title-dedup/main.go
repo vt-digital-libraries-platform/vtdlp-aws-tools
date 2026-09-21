@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +115,12 @@ func (c *Config) validate() error {
 	if c.Rollback {
 		return nil
 	}
+	return c.validateApply()
+}
+
+// validateApply checks the settings needed to compute changes from the input
+// report (used by a normal run and by rollback without a change log).
+func (c *Config) validateApply() error {
 	switch {
 	case c.InputFile == "":
 		return errors.New("input_file is required")
@@ -237,27 +244,7 @@ func main() {
 		return
 	}
 
-	cache := map[string]string{}
-	lookup := func(collectionID string) (string, error) {
-		if v, ok := cache[collectionID]; ok {
-			return v, nil
-		}
-		out, err := db.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName:                aws.String(cfg.CollectionTableName),
-			Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: collectionID}},
-			ProjectionExpression:     aws.String("#i"),
-			ExpressionAttributeNames: map[string]string{"#i": "identifier"},
-		})
-		if err != nil {
-			return "", err
-		}
-		v := ""
-		if s, ok := out.Item["identifier"].(*types.AttributeValueMemberS); ok {
-			v = s.Value
-		}
-		cache[collectionID] = v
-		return v, nil
-	}
+	lookup := newLookup(ctx, db, cfg)
 
 	jobs, err := plan(cfg, lookup)
 	if err != nil {
@@ -409,6 +396,10 @@ func readChanges(path, table string) ([]change, error) {
 // is still the one the tool set, so later manual edits are never clobbered.
 func runRollback(ctx context.Context, db *dynamodb.Client, cfg *Config) bool {
 	changes, err := readChanges(cfg.ChangeLog, cfg.TableName)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Printf("change log %s not found; rebuilding original titles from %s\n", cfg.ChangeLog, cfg.InputFile)
+		changes, err = changesFromInput(ctx, db, cfg)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "rollback:", err)
 		return false
@@ -469,4 +460,56 @@ func runRollback(ctx context.Context, db *dynamodb.Client, cfg *Config) bool {
 
 	fmt.Printf("done: restored=%d skipped=%d failed=%d\n", restored.Load(), skipped.Load(), failed.Load())
 	return failed.Load() == 0
+}
+
+// newLookup returns a cached resolver from Collection id to its identifier.
+// It is only called while planning, from a single goroutine.
+func newLookup(ctx context.Context, db *dynamodb.Client, cfg *Config) func(string) (string, error) {
+	cache := map[string]string{}
+	return func(collectionID string) (string, error) {
+		if v, ok := cache[collectionID]; ok {
+			return v, nil
+		}
+		out, err := db.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:                aws.String(cfg.CollectionTableName),
+			Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: collectionID}},
+			ProjectionExpression:     aws.String("#i"),
+			ExpressionAttributeNames: map[string]string{"#i": "identifier"},
+		})
+		if err != nil {
+			return "", err
+		}
+		v := ""
+		if s, ok := out.Item["identifier"].(*types.AttributeValueMemberS); ok {
+			v = s.Value
+		}
+		cache[collectionID] = v
+		return v, nil
+	}
+}
+
+// changesFromInput rebuilds the change list from the input report using the
+// same filters and suffix as a normal run, for rollback without a change log.
+func changesFromInput(ctx context.Context, db *dynamodb.Client, cfg *Config) ([]change, error) {
+	if err := cfg.validateApply(); err != nil {
+		return nil, fmt.Errorf("change log not found and cannot fall back to input file: %w", err)
+	}
+	jobs, err := plan(cfg, newLookup(ctx, db, cfg))
+	if err != nil {
+		return nil, err
+	}
+	ids, err := idsByIdentifier(ctx, db, cfg.TableName)
+	if err != nil {
+		return nil, err
+	}
+	var out []change
+	for _, j := range jobs {
+		found := ids[j.identifier]
+		if len(found) != 1 {
+			fmt.Printf("SKIP %s: %d table rows match identifier\n", j.identifier, len(found))
+			continue
+		}
+		out = append(out, change{ID: found[0], Identifier: j.identifier, Table: cfg.TableName, OldTitle: j.oldTitle, NewTitle: j.newTitle})
+	}
+	return out, nil
 }
