@@ -13,13 +13,17 @@ input_file: ~/Desktop/duplicate_titles_dev.json
 # Only records whose item_category equals this value are modified.
 item_category: federated
 
+# Optional. Only records whose parent_collection_identifier (as listed in the
+# input report) equals this value are modified. Leave empty for no filtering.
+collection_identifier: iawa
+
 # Text appended to the title. Each modified record then gets "-<index>"
 # after it, where index is 1-based within its duplicate-title group.
 # Example: title "Foo", suffix " dup", -> "Foo dup-1", "Foo dup-2", ...
-suffix: " dup"
+suffix: ": Specimen"
 
 # Number of concurrent worker goroutines.
 concurrency: 10
 
 # Report planned changes without writing. Also forced by the -dry-run flag.
-dry_run: true
+dry_run: false

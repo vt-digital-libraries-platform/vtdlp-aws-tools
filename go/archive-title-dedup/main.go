@@ -24,9 +24,12 @@ type Config struct {
 	TableName    string `yaml:"table_name"`
 	InputFile    string `yaml:"input_file"`
 	ItemCategory string `yaml:"item_category"`
-	Suffix       string `yaml:"suffix"`
-	Concurrency  int    `yaml:"concurrency"`
-	DryRun       bool   `yaml:"dry_run"`
+	// CollectionIdentifier, if set, restricts changes to records whose
+	// parent_collection_identifier in the report equals it.
+	CollectionIdentifier string `yaml:"collection_identifier"`
+	Suffix               string `yaml:"suffix"`
+	Concurrency          int    `yaml:"concurrency"`
+	DryRun               bool   `yaml:"dry_run"`
 }
 
 type Report struct {
@@ -39,8 +42,9 @@ type Group struct {
 }
 
 type Record struct {
-	Identifier   string `json:"identifier"`
-	ItemCategory string `json:"item_category"`
+	Identifier                 string  `json:"identifier"`
+	ItemCategory               string  `json:"item_category"`
+	ParentCollectionIdentifier *string `json:"parent_collection_identifier"`
 }
 
 type job struct {
@@ -106,6 +110,10 @@ func plan(cfg *Config) ([]job, error) {
 			if r.ItemCategory != cfg.ItemCategory {
 				continue
 			}
+			if cfg.CollectionIdentifier != "" &&
+				(r.ParentCollectionIdentifier == nil || *r.ParentCollectionIdentifier != cfg.CollectionIdentifier) {
+				continue
+			}
 			n++
 			jobs = append(jobs, job{
 				identifier: r.Identifier,
@@ -161,7 +169,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "input:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("table=%s category=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, len(jobs), cfg.DryRun)
+	fmt.Printf("table=%s category=%q parent_collection=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, cfg.CollectionIdentifier, len(jobs), cfg.DryRun)
 
 	ctx := context.Background()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
