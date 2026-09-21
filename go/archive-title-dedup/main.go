@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -151,7 +152,7 @@ func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job,
 	}
 	var jobs []job
 	for _, g := range rep.Duplicates {
-		n := 0
+		var matched []Record
 		for _, r := range g.Records {
 			if r.ItemCategory != cfg.ItemCategory {
 				continue
@@ -171,11 +172,16 @@ func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job,
 					continue
 				}
 			}
-			n++
+			matched = append(matched, r)
+		}
+		// Zero-pad the index to the width of the largest index in the group
+		// (10-99 records -> -01, 100-999 -> -001, ...) so titles sort correctly.
+		width := len(strconv.Itoa(len(matched)))
+		for i, r := range matched {
 			jobs = append(jobs, job{
 				identifier: r.Identifier,
 				oldTitle:   g.Title,
-				newTitle:   fmt.Sprintf("%s%s-%d", g.Title, cfg.Suffix, n),
+				newTitle:   fmt.Sprintf("%s%s-%0*d", g.Title, cfg.Suffix, width, i+1),
 			})
 		}
 	}

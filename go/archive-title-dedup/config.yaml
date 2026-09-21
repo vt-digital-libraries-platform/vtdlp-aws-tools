@@ -24,7 +24,9 @@ item_category: federated
 collection_identifier: vtec
 
 # Text appended to the title. Each modified record then gets "-<index>"
-# after it, where index is 1-based within its duplicate-title group.
+# after it, where index is 1-based within its duplicate-title group and
+# zero-padded to the width of the group's largest index so titles sort
+# correctly (1-9 records: -1, 10-99: -01, 100-999: -001, ...).
 # Example: title "Foo", suffix " dup", -> "Foo dup-1", "Foo dup-2", ...
 suffix: ": Specimen"
 
