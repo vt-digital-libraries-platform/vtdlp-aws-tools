@@ -1,0 +1,25 @@
+# Configuration for archive-title-dedup.
+# Run with: archive-title-dedup -config config.yaml [-dry-run]
+
+# AWS region the table lives in.
+region: us-east-1
+
+# Archive table to update.
+table_name: Archive-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
+
+# Duplicate-titles report (JSON) produced from the table.
+input_file: ~/Desktop/duplicate_titles_dev.json
+
+# Only records whose item_category equals this value are modified.
+item_category: federated
+
+# Text appended to the title. Each modified record then gets "-<index>"
+# after it, where index is 1-based within its duplicate-title group.
+# Example: title "Foo", suffix " dup", -> "Foo dup-1", "Foo dup-2", ...
+suffix: " dup"
+
+# Number of concurrent worker goroutines.
+concurrency: 10
+
+# Report planned changes without writing. Also forced by the -dry-run flag.
+dry_run: true
