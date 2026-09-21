@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,21 @@ type Config struct {
 	Suffix              string `yaml:"suffix"`
 	Concurrency         int    `yaml:"concurrency"`
 	DryRun              bool   `yaml:"dry_run"`
+	// ChangeLog is a JSON-lines file: every applied title change is appended
+	// to it, and rollback reads it to restore the original titles.
+	ChangeLog string `yaml:"change_log"`
+	// Rollback restores titles from ChangeLog instead of applying changes.
+	// Also enabled by the -rollback flag.
+	Rollback bool `yaml:"rollback"`
+}
+
+// change is one line of the change log.
+type change struct {
+	ID         string `json:"id"`
+	Identifier string `json:"identifier"`
+	Table      string `json:"table"`
+	OldTitle   string `json:"old_title"`
+	NewTitle   string `json:"new_title"`
 }
 
 type Report struct {
@@ -76,27 +92,39 @@ func loadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, err
 	}
-	switch {
-	case c.TableName == "":
-		return nil, errors.New("table_name is required")
-	case c.InputFile == "":
-		return nil, errors.New("input_file is required")
-	case c.ItemCategory == "":
-		return nil, errors.New("item_category is required")
-	case c.Suffix == "":
-		return nil, errors.New("suffix is required")
-	}
-	if c.CollectionIdentifier != "" && c.CollectionTableName == "" {
-		return nil, errors.New("collection_table_name is required when collection_identifier is set")
-	}
 	if c.Region == "" {
 		c.Region = "us-east-1"
 	}
 	if c.Concurrency < 1 {
 		c.Concurrency = 10
 	}
+	if c.ChangeLog == "" {
+		c.ChangeLog = "title-changes.jsonl"
+	}
 	c.InputFile = expandHome(c.InputFile)
+	c.ChangeLog = expandHome(c.ChangeLog)
 	return &c, nil
+}
+
+// validate checks the settings needed for the selected mode.
+func (c *Config) validate() error {
+	if c.TableName == "" {
+		return errors.New("table_name is required")
+	}
+	if c.Rollback {
+		return nil
+	}
+	switch {
+	case c.InputFile == "":
+		return errors.New("input_file is required")
+	case c.ItemCategory == "":
+		return errors.New("item_category is required")
+	case c.Suffix == "":
+		return errors.New("suffix is required")
+	case c.CollectionIdentifier != "" && c.CollectionTableName == "":
+		return errors.New("collection_table_name is required when collection_identifier is set")
+	}
+	return nil
 }
 
 // plan builds the list of title changes: every record in a duplicate group
@@ -175,6 +203,7 @@ func idsByIdentifier(ctx context.Context, db *dynamodb.Client, table string) (ma
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to YAML config")
 	dry := flag.Bool("dry-run", false, "report changes without writing")
+	rollback := flag.Bool("rollback", false, "restore original titles from the change log")
 	flag.Parse()
 
 	cfg, err := loadConfig(*cfgPath)
@@ -185,6 +214,13 @@ func main() {
 	if *dry {
 		cfg.DryRun = true
 	}
+	if *rollback {
+		cfg.Rollback = true
+	}
+	if err := cfg.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
@@ -193,6 +229,13 @@ func main() {
 		os.Exit(1)
 	}
 	db := dynamodb.NewFromConfig(awsCfg)
+
+	if cfg.Rollback {
+		if !runRollback(ctx, db, cfg) {
+			os.Exit(1)
+		}
+		return
+	}
 
 	cache := map[string]string{}
 	lookup := func(collectionID string) (string, error) {
@@ -227,6 +270,19 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scan:", err)
 		os.Exit(1)
+	}
+
+	var logFile *os.File
+	var enc *json.Encoder
+	if !cfg.DryRun && len(jobs) > 0 {
+		logFile, err = os.OpenFile(cfg.ChangeLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "change log:", err)
+			os.Exit(1)
+		}
+		defer logFile.Close()
+		enc = json.NewEncoder(logFile)
+		enc.SetEscapeHTML(false)
 	}
 
 	var updated, skipped, failed atomic.Int64
@@ -280,6 +336,14 @@ func main() {
 					logf("FAIL %s: %v", j.identifier, err)
 					failed.Add(1)
 				default:
+					// Record the change before reporting it so a rollback
+					// can always undo what was written.
+					logMu.Lock()
+					werr := enc.Encode(change{ID: found[0], Identifier: j.identifier, Table: cfg.TableName, OldTitle: j.oldTitle, NewTitle: j.newTitle})
+					logMu.Unlock()
+					if werr != nil {
+						logf("WARN %s: change log write failed: %v", j.identifier, werr)
+					}
 					logf("OK   %s: %q -> %q", j.identifier, j.oldTitle, j.newTitle)
 					updated.Add(1)
 				}
@@ -293,7 +357,116 @@ func main() {
 	wg.Wait()
 
 	fmt.Printf("done: updated=%d skipped=%d failed=%d\n", updated.Load(), skipped.Load(), failed.Load())
+	if !cfg.DryRun && updated.Load() > 0 {
+		fmt.Printf("change log: %s (use -rollback to undo)\n", cfg.ChangeLog)
+	}
 	if failed.Load() > 0 {
 		os.Exit(1)
 	}
+}
+
+// readChanges loads the change log and collapses repeated changes to the same
+// row into one: the earliest old title and the latest new title.
+func readChanges(path, table string) ([]change, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	byID := map[string]*change{}
+	var order []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for n := 1; sc.Scan(); n++ {
+		if strings.TrimSpace(sc.Text()) == "" {
+			continue
+		}
+		var c change
+		if err := json.Unmarshal(sc.Bytes(), &c); err != nil {
+			return nil, fmt.Errorf("%s line %d: %w", path, n, err)
+		}
+		if c.Table != table {
+			return nil, fmt.Errorf("%s line %d: change is for table %s, config is %s", path, n, c.Table, table)
+		}
+		if prev, ok := byID[c.ID]; ok {
+			prev.NewTitle = c.NewTitle
+			continue
+		}
+		byID[c.ID] = &c
+		order = append(order, c.ID)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]change, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	return out, nil
+}
+
+// runRollback restores each logged title. A row is only written if its title
+// is still the one the tool set, so later manual edits are never clobbered.
+func runRollback(ctx context.Context, db *dynamodb.Client, cfg *Config) bool {
+	changes, err := readChanges(cfg.ChangeLog, cfg.TableName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "rollback:", err)
+		return false
+	}
+	fmt.Printf("rollback table=%s log=%s changes=%d dry_run=%v\n", cfg.TableName, cfg.ChangeLog, len(changes), cfg.DryRun)
+
+	var restored, skipped, failed atomic.Int64
+	var logMu sync.Mutex
+	logf := func(format string, a ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		fmt.Printf(format+"\n", a...)
+	}
+
+	work := make(chan change)
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.Concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range work {
+				if cfg.DryRun {
+					logf("DRY  %s: %q -> %q", c.Identifier, c.NewTitle, c.OldTitle)
+					restored.Add(1)
+					continue
+				}
+				_, err := db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName:                aws.String(cfg.TableName),
+					Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: c.ID}},
+					UpdateExpression:         aws.String("SET #t = :old"),
+					ConditionExpression:      aws.String("#t = :new"),
+					ExpressionAttributeNames: map[string]string{"#t": "title"},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":old": &types.AttributeValueMemberS{Value: c.OldTitle},
+						":new": &types.AttributeValueMemberS{Value: c.NewTitle},
+					},
+				})
+				var ccf *types.ConditionalCheckFailedException
+				switch {
+				case errors.As(err, &ccf):
+					logf("SKIP %s: title is no longer %q", c.Identifier, c.NewTitle)
+					skipped.Add(1)
+				case err != nil:
+					logf("FAIL %s: %v", c.Identifier, err)
+					failed.Add(1)
+				default:
+					logf("OK   %s: %q -> %q", c.Identifier, c.NewTitle, c.OldTitle)
+					restored.Add(1)
+				}
+			}
+		}()
+	}
+	for _, c := range changes {
+		work <- c
+	}
+	close(work)
+	wg.Wait()
+
+	fmt.Printf("done: restored=%d skipped=%d failed=%d\n", restored.Load(), skipped.Load(), failed.Load())
+	return failed.Load() == 0
 }
