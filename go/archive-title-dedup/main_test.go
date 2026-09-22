@@ -154,6 +154,24 @@ func TestPlanRollback_WorksOnAPlainReportWithNoNewTitle(t *testing.T) {
 	}
 }
 
+func TestPlanRevertLegacy_StripsSuffixAndIndex(t *testing.T) {
+	live := []Job{
+		{Id: "id-1", Identifier: "VTEC01", OldTitle: "Limenitidinae: Specimen-13"},
+		{Id: "id-2", Identifier: "VTEC02", OldTitle: "Colias eurytheme (Boisduval, 1852): Specimen-01"},
+		{Id: "id-3", Identifier: "VTEC03", OldTitle: "Not disambiguated"},
+	}
+
+	jobs := planRevertLegacy(live, ": Specimen")
+
+	want := []Job{
+		{Id: "id-1", Identifier: "VTEC01", OldTitle: "Limenitidinae: Specimen-13", NewTitle: "Limenitidinae"},
+		{Id: "id-2", Identifier: "VTEC02", OldTitle: "Colias eurytheme (Boisduval, 1852): Specimen-01", NewTitle: "Colias eurytheme (Boisduval, 1852)"},
+	}
+	if !reflect.DeepEqual(jobs, want) {
+		t.Fatalf("planRevertLegacy() = %+v, want %+v", jobs, want)
+	}
+}
+
 func TestPlanRollback_SkipsRecordsWithNoCollectionIdentifier(t *testing.T) {
 	rep := &Report{
 		Duplicates: []Group{

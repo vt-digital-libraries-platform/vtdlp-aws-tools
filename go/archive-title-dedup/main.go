@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -338,6 +339,82 @@ func planRollback(rep *Report, collectionIdentifier string) []Job {
 	return jobs
 }
 
+// collectionIDForIdentifier scans the collection table and returns the id of
+// the collection whose identifier matches ident.
+func collectionIDForIdentifier(ctx context.Context, db *dynamodb.Client, table, ident string) (string, error) {
+	index, err := buildCollectionIndex(ctx, db, table)
+	if err != nil {
+		return "", err
+	}
+	for id, i := range index {
+		if i == ident {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("no collection found with identifier %q", ident)
+}
+
+// scanCollectionTitles scans the Archive table and returns every record
+// whose parent_collection[0] equals collectionID, with its current live
+// title.
+func scanCollectionTitles(ctx context.Context, db *dynamodb.Client, table, collectionID string) ([]Job, error) {
+	var jobs []Job
+	p := dynamodb.NewScanPaginator(db, &dynamodb.ScanInput{
+		TableName:            aws.String(table),
+		ProjectionExpression: aws.String("#t, #i, #p, #id"),
+		ExpressionAttributeNames: map[string]string{
+			"#t": "title", "#i": "identifier", "#p": "parent_collection", "#id": "id",
+		},
+	})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range page.Items {
+			collID := firstParent(it)
+			if collID == nil || *collID != collectionID {
+				continue
+			}
+			title, ok := str(it, "title")
+			if !ok || title == "" {
+				continue
+			}
+			ident, _ := str(it, "identifier")
+			id, _ := str(it, "id")
+			jobs = append(jobs, Job{Id: id, Identifier: ident, OldTitle: title})
+		}
+	}
+	return jobs, nil
+}
+
+// legacySuffixPattern matches a title ending in the given literal suffix
+// followed by "-<digits>", as written by the pre-`apply` version of this
+// tool (newTitle = oldTitle + suffix + "-" + zero-padded index). Capture
+// group 1 is the original title with the suffix removed.
+func legacySuffixPattern(suffix string) *regexp.Regexp {
+	return regexp.MustCompile(`^(.*)` + regexp.QuoteMeta(suffix) + `-\d+$`)
+}
+
+// planRevertLegacy finds every record in live (as returned by
+// scanCollectionTitles) whose current title matches the legacy
+// "<original>%s-<index>" pattern for suffix, and plans restoring it to the
+// captured original title. Records whose title doesn't match are left out.
+func planRevertLegacy(live []Job, suffix string) []Job {
+	pat := legacySuffixPattern(suffix)
+	var jobs []Job
+	for _, j := range live {
+		m := pat.FindStringSubmatch(j.OldTitle)
+		if m == nil {
+			continue
+		}
+		j.NewTitle = m[1]
+		jobs = append(jobs, j)
+	}
+	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Identifier < jobs[b].Identifier })
+	return jobs
+}
+
 // writeJobs sets title = job.NewTitle for each job, using up to concurrency
 // goroutines, and returns the number of records successfully written.
 func writeJobs(ctx context.Context, db *dynamodb.Client, table string, jobs []Job, concurrency int) (int, error) {
@@ -426,6 +503,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  report    scan the table and write the duplicate-titles report")
 	fmt.Fprintln(os.Stderr, "  apply     disambiguate one collection's duplicate titles")
 	fmt.Fprintln(os.Stderr, "  rollback  restore titles recorded in a report or change-log file")
+	fmt.Fprintln(os.Stderr, "  revert-legacy  restore titles disambiguated by the pre-apply tool, with no report/change-log available")
 	os.Exit(2)
 }
 
@@ -440,6 +518,8 @@ func main() {
 		runApply(os.Args[2:])
 	case "rollback":
 		runRollback(os.Args[2:])
+	case "revert-legacy":
+		runRevertLegacy(os.Args[2:])
 	case "-h", "-help", "--help", "help":
 		usage()
 	default:
@@ -646,6 +726,90 @@ func runRollback(args []string) {
 		os.Exit(1)
 	}
 	db := dynamodb.NewFromConfig(awsCfg)
+
+	written, err := writeJobs(ctx, db, cfg.TableName, jobs, cfg.Concurrency)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "write:", err)
+	}
+	fmt.Printf("reverted %d/%d records\n", written, len(jobs))
+	if err != nil {
+		os.Exit(1)
+	}
+}
+
+// runRevertLegacy handles the case where a collection was disambiguated by
+// the pre-`apply` version of this tool (title + suffix + "-" + zero-padded
+// index, no report or change-log written) and there's nothing for `rollback`
+// to read. It re-derives the original titles straight from the live table by
+// matching and stripping that legacy suffix pattern.
+func runRevertLegacy(args []string) {
+	fs := flag.NewFlagSet("revert-legacy", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	collectionIdentifier := fs.String("collection_identifier", "", "collection to revert (falls back to config.yaml)")
+	suffix := fs.String("suffix", "", "literal suffix text that was inserted before the legacy '-<index>' (falls back to config.yaml)")
+	dryRun := fs.Bool("dry-run", false, "log planned changes without writing to DynamoDB")
+	fs.Parse(args)
+
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(1)
+	}
+	if cfg.CollectionTableName == "" {
+		fmt.Fprintln(os.Stderr, "config: collection_table_name is required")
+		os.Exit(1)
+	}
+
+	collID := *collectionIdentifier
+	if collID == "" {
+		collID = cfg.CollectionIdentifier
+	}
+	if collID == "" {
+		fmt.Fprintln(os.Stderr, "revert-legacy: -collection_identifier is required (flag or config.yaml)")
+		os.Exit(2)
+	}
+	suf := *suffix
+	if suf == "" {
+		suf = cfg.Suffix
+	}
+	if suf == "" {
+		fmt.Fprintln(os.Stderr, "revert-legacy: -suffix is required (flag or config.yaml)")
+		os.Exit(2)
+	}
+
+	ctx := context.Background()
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "aws:", err)
+		os.Exit(1)
+	}
+	db := dynamodb.NewFromConfig(awsCfg)
+
+	collectionID, err := collectionIDForIdentifier(ctx, db, cfg.CollectionTableName, collID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "collection lookup:", err)
+		os.Exit(1)
+	}
+
+	live, err := scanCollectionTitles(ctx, db, cfg.TableName, collectionID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "scan:", err)
+		os.Exit(1)
+	}
+
+	jobs := planRevertLegacy(live, suf)
+	if len(jobs) == 0 {
+		fmt.Printf("no records in collection %s have a title matching suffix %q\n", collID, suf)
+		return
+	}
+
+	for _, j := range jobs {
+		fmt.Printf("%s: %q -> %q\n", j.Identifier, j.OldTitle, j.NewTitle)
+	}
+	if *dryRun {
+		fmt.Printf("dry-run: %d records would be reverted\n", len(jobs))
+		return
+	}
 
 	written, err := writeJobs(ctx, db, cfg.TableName, jobs, cfg.Concurrency)
 	if err != nil {

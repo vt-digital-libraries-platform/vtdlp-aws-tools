@@ -11,6 +11,9 @@ Three subcommands:
   collection's records, writing a change-log of what it did.
 - `rollback` — reads a report or change-log and restores the recorded
   original titles.
+- `revert-legacy` — restores titles disambiguated by the pre-`apply`
+  version of this tool, for a collection with no report or change-log to
+  roll back from.
 
 ## Build
 
@@ -145,6 +148,24 @@ written by `apply` — both share the same JSON shape.
 `-collection_identifier` falls back to `collection_identifier` in
 `config.yaml` when omitted. `-dry-run` logs the planned changes without
 writing to DynamoDB.
+
+### revert-legacy
+
+```
+archive-title-dedup revert-legacy -config config.yaml \
+  -collection_identifier vtec \
+  -suffix ": Specimen" \
+  [-dry-run]
+```
+
+For a collection that was disambiguated by an older version of this tool
+(before `apply`/`rollback` existed, when titles were rewritten to
+`<original title><suffix>-<index>` with no report or change-log written),
+scans the live table for records in `-collection_identifier` whose title
+still ends in `<suffix>-<digits>`, and restores each to the title with
+that suffix and index stripped off. `-collection_identifier` and `-suffix`
+fall back to `collection_identifier` and `suffix` in `config.yaml` when
+omitted. `-dry-run` logs the planned changes without writing to DynamoDB.
 
 ## Typical workflow
 
