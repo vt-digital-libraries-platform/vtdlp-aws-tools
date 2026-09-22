@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -24,12 +25,24 @@ type Config struct {
 	TableName  string `yaml:"table_name"`
 	OutputDir  string `yaml:"output_dir"`
 	OutputFile string `yaml:"output_file"`
-	// Concurrency is the number of parallel scan segments (one goroutine each).
+	// Concurrency is the number of parallel scan segments (one goroutine each),
+	// and also the number of parallel writers used by apply/rollback.
 	Concurrency int `yaml:"concurrency"`
+	// CollectionIdentifier and Suffix are fallback defaults for apply's
+	// -collection_identifier/-suffix flags, used only when a flag is omitted.
+	CollectionIdentifier string `yaml:"collection_identifier"`
+	Suffix               string `yaml:"suffix"`
 }
 
+// Report is the shape written by `report` and read back by `apply` and
+// `rollback`. `apply` also writes its change-log in this same shape (with
+// CollectionIdentifier/Timestamp populated and each written record's
+// NewTitle filled in) so that `rollback` can accept either file
+// interchangeably.
 type Report struct {
-	Duplicates []Group `json:"duplicates"`
+	CollectionIdentifier string  `json:"collection_identifier,omitempty"`
+	Timestamp            string  `json:"timestamp,omitempty"`
+	Duplicates           []Group `json:"duplicates"`
 }
 
 type Group struct {
@@ -38,8 +51,12 @@ type Group struct {
 }
 
 type Record struct {
+	Id               string  `json:"id"`
 	Identifier       string  `json:"identifier"`
 	ParentCollection *string `json:"parent_collection"`
+	// NewTitle is set only in a change-log written by `apply`, recording the
+	// title that was actually written for this record.
+	NewTitle *string `json:"new_title,omitempty"`
 }
 
 func expandHome(p string) string {
@@ -111,9 +128,9 @@ func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, to
 	scanned := 0
 	in := &dynamodb.ScanInput{
 		TableName:            aws.String(table),
-		ProjectionExpression: aws.String("#t, #i, #p"),
+		ProjectionExpression: aws.String("#t, #i, #p, #id"),
 		ExpressionAttributeNames: map[string]string{
-			"#t": "title", "#i": "identifier", "#p": "parent_collection",
+			"#t": "title", "#i": "identifier", "#p": "parent_collection", "#id": "id",
 		},
 	}
 	if total > 1 {
@@ -133,7 +150,8 @@ func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, to
 				continue
 			}
 			ident, _ := str(it, "identifier")
-			byTitle[title] = append(byTitle[title], Record{Identifier: ident, ParentCollection: firstParent(it)})
+			id, _ := str(it, "id")
+			byTitle[title] = append(byTitle[title], Record{Id: id, Identifier: ident, ParentCollection: firstParent(it)})
 		}
 	}
 	return byTitle, scanned, nil
@@ -189,12 +207,160 @@ func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, work
 	return rep, scanned, nil
 }
 
+// loadReport reads a report or change-log file (same JSON shape) from path.
+func loadReport(path string) (*Report, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var rep Report
+	if err := json.Unmarshal(data, &rep); err != nil {
+		return nil, err
+	}
+	return &rep, nil
+}
+
+// Job is a single planned write: set the record identified by Id's title to
+// NewTitle. OldTitle is carried along purely for logging/audit.
+type Job struct {
+	Id         string
+	Identifier string
+	OldTitle   string
+	NewTitle   string
+}
+
+// planApply computes the writes needed to disambiguate every record in rep
+// belonging to collectionIdentifier: <original title> - <suffix>:<identifier>.
+// Records in other collections are left untouched, including other members
+// of a title-group that spans multiple collections.
+func planApply(rep *Report, collectionIdentifier, suffix string) []Job {
+	var jobs []Job
+	for _, g := range rep.Duplicates {
+		for _, r := range g.Records {
+			if r.ParentCollection == nil || *r.ParentCollection != collectionIdentifier {
+				continue
+			}
+			jobs = append(jobs, Job{
+				Id:         r.Id,
+				Identifier: r.Identifier,
+				OldTitle:   g.Title,
+				NewTitle:   fmt.Sprintf("%s - %s:%s", g.Title, suffix, r.Identifier),
+			})
+		}
+	}
+	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Identifier < jobs[b].Identifier })
+	return jobs
+}
+
+// planRollback computes the writes needed to restore every record in rep to
+// its recorded title (g.Title), regardless of the record's current live
+// value in DynamoDB. rep may be an original report or a change-log written
+// by apply; both share this shape.
+func planRollback(rep *Report) []Job {
+	var jobs []Job
+	for _, g := range rep.Duplicates {
+		for _, r := range g.Records {
+			old := ""
+			if r.NewTitle != nil {
+				old = *r.NewTitle
+			}
+			jobs = append(jobs, Job{
+				Id:         r.Id,
+				Identifier: r.Identifier,
+				OldTitle:   old,
+				NewTitle:   g.Title,
+			})
+		}
+	}
+	sort.Slice(jobs, func(a, b int) bool { return jobs[a].Identifier < jobs[b].Identifier })
+	return jobs
+}
+
+// writeJobs sets title = job.NewTitle for each job, using up to concurrency
+// goroutines, and returns the number of records successfully written.
+func writeJobs(ctx context.Context, db *dynamodb.Client, table string, jobs []Job, concurrency int) (int, error) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+		written  int
+		sem      = make(chan struct{}, concurrency)
+	)
+	for _, j := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j Job) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			_, err := db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+				TableName: aws.String(table),
+				Key: map[string]types.AttributeValue{
+					"id": &types.AttributeValueMemberS{Value: j.Id},
+				},
+				UpdateExpression: aws.String("SET #t = :t"),
+				ExpressionAttributeNames: map[string]string{
+					"#t": "title",
+				},
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":t": &types.AttributeValueMemberS{Value: j.NewTitle},
+				},
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("update %s (id=%s): %w", j.Identifier, j.Id, err)
+				}
+				return
+			}
+			written++
+		}(j)
+	}
+	wg.Wait()
+	return written, firstErr
+}
+
+// buildChangeLog groups the jobs actually written into the same shape as a
+// report, so that `rollback` can later read this file back with the exact
+// same code path used for an original report.
+func buildChangeLog(collectionIdentifier string, jobs []Job) *Report {
+	byTitle := map[string][]Record{}
+	var titles []string
+	for _, j := range jobs {
+		newTitle := j.NewTitle
+		if _, ok := byTitle[j.OldTitle]; !ok {
+			titles = append(titles, j.OldTitle)
+		}
+		byTitle[j.OldTitle] = append(byTitle[j.OldTitle], Record{
+			Id:               j.Id,
+			Identifier:       j.Identifier,
+			ParentCollection: &collectionIdentifier,
+			NewTitle:         &newTitle,
+		})
+	}
+	sort.Strings(titles)
+	rep := &Report{
+		CollectionIdentifier: collectionIdentifier,
+		Timestamp:            time.Now().UTC().Format("20060102T150405Z"),
+		Duplicates:           []Group{},
+	}
+	for _, t := range titles {
+		rep.Duplicates = append(rep.Duplicates, Group{Title: t, Records: byTitle[t]})
+	}
+	return rep
+}
+
 // usage lists the available commands and exits 2, matching the flag
 // package's own convention for a bad invocation.
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: archive-title-dedup <command> [flags]")
 	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  report   scan the table and write the duplicate-titles report")
+	fmt.Fprintln(os.Stderr, "  report    scan the table and write the duplicate-titles report")
+	fmt.Fprintln(os.Stderr, "  apply     disambiguate one collection's duplicate titles")
+	fmt.Fprintln(os.Stderr, "  rollback  restore titles recorded in a report or change-log file")
 	os.Exit(2)
 }
 
@@ -205,6 +371,10 @@ func main() {
 	switch cmd := os.Args[1]; cmd {
 	case "report":
 		runReport(os.Args[2:])
+	case "apply":
+		runApply(os.Args[2:])
+	case "rollback":
+		runRollback(os.Args[2:])
 	case "-h", "-help", "--help", "help":
 		usage()
 	default:
@@ -253,4 +423,150 @@ func runReport(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("scanned %d records; %d duplicate titles written to %s\n", scanned, len(rep.Duplicates), out)
+}
+
+func runApply(args []string) {
+	fs := flag.NewFlagSet("apply", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	inputPath := fs.String("input", "", "path to the input report or change-log JSON (required)")
+	collectionIdentifier := fs.String("collection_identifier", "", "collection to disambiguate (falls back to config.yaml)")
+	suffix := fs.String("suffix", "", "human-readable label inserted before the identifier (falls back to config.yaml)")
+	dryRun := fs.Bool("dry-run", false, "log planned changes without writing to DynamoDB")
+	fs.Parse(args)
+
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(1)
+	}
+
+	if *inputPath == "" {
+		fmt.Fprintln(os.Stderr, "apply: -input is required")
+		os.Exit(2)
+	}
+	collID := *collectionIdentifier
+	if collID == "" {
+		collID = cfg.CollectionIdentifier
+	}
+	if collID == "" {
+		fmt.Fprintln(os.Stderr, "apply: -collection_identifier is required (flag or config.yaml)")
+		os.Exit(2)
+	}
+	suf := *suffix
+	if suf == "" {
+		suf = cfg.Suffix
+	}
+	if suf == "" {
+		fmt.Fprintln(os.Stderr, "apply: -suffix is required (flag or config.yaml)")
+		os.Exit(2)
+	}
+
+	rep, err := loadReport(*inputPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "input:", err)
+		os.Exit(1)
+	}
+
+	jobs := planApply(rep, collID, suf)
+	if len(jobs) == 0 {
+		fmt.Printf("no records found for collection %s in %s\n", collID, *inputPath)
+		return
+	}
+
+	for _, j := range jobs {
+		fmt.Printf("%s: %q -> %q\n", j.Identifier, j.OldTitle, j.NewTitle)
+	}
+	if *dryRun {
+		fmt.Printf("dry-run: %d records would be updated in collection %s\n", len(jobs), collID)
+		return
+	}
+
+	ctx := context.Background()
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "aws:", err)
+		os.Exit(1)
+	}
+	db := dynamodb.NewFromConfig(awsCfg)
+
+	written, err := writeJobs(ctx, db, cfg.TableName, jobs, cfg.Concurrency)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "write:", err)
+	}
+
+	changeLog := buildChangeLog(collID, jobs)
+	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "output:", err)
+		os.Exit(1)
+	}
+	logPath := filepath.Join(cfg.OutputDir, fmt.Sprintf("changelog_%s_%s.json", collID, changeLog.Timestamp))
+	data, mErr := json.MarshalIndent(changeLog, "", "  ")
+	if mErr != nil {
+		fmt.Fprintln(os.Stderr, "output:", mErr)
+		os.Exit(1)
+	}
+	if wErr := os.WriteFile(logPath, append(data, '\n'), 0o644); wErr != nil {
+		fmt.Fprintln(os.Stderr, "output:", wErr)
+		os.Exit(1)
+	}
+	fmt.Printf("wrote %d/%d records; change-log written to %s\n", written, len(jobs), logPath)
+	if err != nil {
+		os.Exit(1)
+	}
+}
+
+func runRollback(args []string) {
+	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	dryRun := fs.Bool("dry-run", false, "log planned changes without writing to DynamoDB")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: archive-title-dedup rollback [-config config.yaml] [-dry-run] <report-or-changelog.json>")
+		os.Exit(2)
+	}
+	inputPath := fs.Arg(0)
+
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		os.Exit(1)
+	}
+
+	rep, err := loadReport(inputPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "input:", err)
+		os.Exit(1)
+	}
+
+	jobs := planRollback(rep)
+	if len(jobs) == 0 {
+		fmt.Printf("no records found in %s\n", inputPath)
+		return
+	}
+
+	for _, j := range jobs {
+		fmt.Printf("%s: %q -> %q\n", j.Identifier, j.OldTitle, j.NewTitle)
+	}
+	if *dryRun {
+		fmt.Printf("dry-run: %d records would be reverted\n", len(jobs))
+		return
+	}
+
+	ctx := context.Background()
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "aws:", err)
+		os.Exit(1)
+	}
+	db := dynamodb.NewFromConfig(awsCfg)
+
+	written, err := writeJobs(ctx, db, cfg.TableName, jobs, cfg.Concurrency)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "write:", err)
+	}
+	fmt.Printf("reverted %d/%d records\n", written, len(jobs))
+	if err != nil {
+		os.Exit(1)
+	}
 }
