@@ -94,15 +94,17 @@ in a change-log written by `apply` (an original `report` omits them).
 archive-title-dedup report -config config.yaml
 ```
 
-Scans the whole table and writes `<output_dir>/<output_file>` (default
-`output/duplicate_titles.json`) containing every title shared by two or more
-records.
+Scans the whole table and writes
+`<output_dir>/<timestamp>_<output_file>` (default
+`output/20260922T153000Z_duplicate_titles.json`) containing every title
+shared by two or more records. `<timestamp>` is `YYYYMMDDTHHMMSSZ` (UTC),
+so successive runs never overwrite each other's report.
 
 ### apply
 
 ```
 archive-title-dedup apply -config config.yaml \
-  -input output/duplicate_titles.json \
+  -input output/20260922T153000Z_duplicate_titles.json \
   -collection_identifier FCHS_OBJ \
   -suffix Map \
   [-dry-run]
@@ -148,9 +150,10 @@ writing to DynamoDB.
 
 ```
 archive-title-dedup report -config config.yaml
-archive-title-dedup apply -config config.yaml -input output/duplicate_titles.json \
+# -> output/<timestamp>_duplicate_titles.json
+archive-title-dedup apply -config config.yaml -input output/<timestamp>_duplicate_titles.json \
   -collection_identifier FCHS_OBJ -suffix Map -dry-run
-archive-title-dedup apply -config config.yaml -input output/duplicate_titles.json \
+archive-title-dedup apply -config config.yaml -input output/<timestamp>_duplicate_titles.json \
   -collection_identifier FCHS_OBJ -suffix Map
 # ... if something needs undoing:
 archive-title-dedup rollback -config config.yaml -collection_identifier FCHS_OBJ \

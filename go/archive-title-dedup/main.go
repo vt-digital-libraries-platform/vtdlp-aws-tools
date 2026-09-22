@@ -487,7 +487,8 @@ func runReport(args []string) {
 		fmt.Fprintln(os.Stderr, "output:", err)
 		os.Exit(1)
 	}
-	out := filepath.Join(cfg.OutputDir, cfg.OutputFile)
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	out := filepath.Join(cfg.OutputDir, timestamp+"_"+cfg.OutputFile)
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "output:", err)
