@@ -580,7 +580,46 @@ func runReport(args []string) {
 		fmt.Fprintln(os.Stderr, "output:", err)
 		os.Exit(1)
 	}
+	collections := duplicateCollections(rep)
+	mdOut := filepath.Join(cfg.OutputDir, base+"_"+timestamp+".md")
+	if err := os.WriteFile(mdOut, []byte(collectionsMarkdown(collections)), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, "output:", err)
+		os.Exit(1)
+	}
 	fmt.Printf("scanned %d records; %d duplicate titles written to %s\n", scanned, len(rep.Duplicates), out)
+	fmt.Printf("%d collections with duplicate titles written to %s\n", len(collections), mdOut)
+}
+
+// duplicateCollections returns the sorted, de-duplicated identifiers of every
+// collection holding at least one record in rep, i.e. every collection that
+// apply would change. Records with no resolved collection are skipped.
+func duplicateCollections(rep *Report) []string {
+	seen := map[string]bool{}
+	for _, g := range rep.Duplicates {
+		for _, r := range g.Records {
+			if r.CollectionIdentifier != nil {
+				seen[*r.CollectionIdentifier] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func collectionsMarkdown(ids []string) string {
+	var b strings.Builder
+	b.WriteString("# Collections with duplicate titles\n\n")
+	if len(ids) == 0 {
+		b.WriteString("None.\n")
+	}
+	for _, id := range ids {
+		fmt.Fprintf(&b, "- %s\n", id)
+	}
+	return b.String()
 }
 
 func runApply(args []string) {

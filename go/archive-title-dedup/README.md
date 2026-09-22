@@ -103,6 +103,13 @@ Scans the whole table and writes
 shared by two or more records. `<timestamp>` is `YYYYMMDDTHHMMSSZ` (UTC),
 so successive runs never overwrite each other's report.
 
+Alongside it, `report` writes a Markdown file with the same name but a `.md`
+extension (default `output/duplicate_titles_20260922T153000Z.md`) listing
+the identifier of every collection that has at least one record with a
+duplicate title. Those are the collections you can pass to `apply
+-collection_identifier`. Records whose collection could not be resolved are
+not included.
+
 ### apply
 
 ```
