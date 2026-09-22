@@ -24,8 +24,8 @@ func TestPlanApply_FiltersByCollectionAndFormatsTitle(t *testing.T) {
 	jobs := planApply(rep, "coll-a", "Map")
 
 	want := []Job{
-		{Id: "id-1", Identifier: "nmcst005196", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005196"},
-		{Id: "id-2", Identifier: "nmcst005197", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005197"},
+		{Id: "id-1", Identifier: "nmcst005196", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map: nmcst005196"},
+		{Id: "id-2", Identifier: "nmcst005197", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map: nmcst005197"},
 	}
 	if !reflect.DeepEqual(jobs, want) {
 		t.Fatalf("planApply() = %+v, want %+v", jobs, want)
@@ -95,8 +95,8 @@ func TestPlanApply_IsIdempotent(t *testing.T) {
 }
 
 func TestPlanRollback_RestoresRecordedOriginalOnlyForMatchingCollection(t *testing.T) {
-	newTitleA := "1957 Coeburn Quadrangle Virginia - Map:nmcst005196"
-	newTitleB := "American Flag - Photo:sfdst006019"
+	newTitleA := "1957 Coeburn Quadrangle Virginia - Map: nmcst005196"
+	newTitleB := "American Flag - Photo: sfdst006019"
 	rep := &Report{
 		CollectionIdentifier: "coll-a",
 		Timestamp:            "20260922T000000Z",

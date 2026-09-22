@@ -112,7 +112,7 @@ For every record in `-input` whose `collection_identifier` matches
 `-collection_identifier`, rewrites its title to:
 
 ```
-<original title> - <suffix>:<record identifier>
+<original title> - <suffix>: <record identifier>
 ```
 
 Records belonging to other collections — including other members of a

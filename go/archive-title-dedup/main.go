@@ -301,7 +301,7 @@ func planApply(rep *Report, collectionIdentifier, suffix string) []Job {
 				CollectionID:         collID,
 				CollectionIdentifier: *r.CollectionIdentifier,
 				OldTitle:             g.Title,
-				NewTitle:             fmt.Sprintf("%s - %s:%s", g.Title, suffix, r.Identifier),
+				NewTitle:             fmt.Sprintf("%s - %s: %s", g.Title, suffix, r.Identifier),
 			})
 		}
 	}
