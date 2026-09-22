@@ -191,7 +191,13 @@ func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, work
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to YAML config")
+	report := flag.Bool("report", false, "scan the table and write the duplicate-titles report")
 	flag.Parse()
+
+	if !*report {
+		fmt.Fprintln(os.Stderr, "nothing to do: pass -report to scan the table and write the duplicate-titles report")
+		os.Exit(1)
+	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
