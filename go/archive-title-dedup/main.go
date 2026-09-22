@@ -568,7 +568,9 @@ func runReport(args []string) {
 		os.Exit(1)
 	}
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	out := filepath.Join(cfg.OutputDir, timestamp+"_"+cfg.OutputFile)
+	ext := filepath.Ext(cfg.OutputFile)
+	base := strings.TrimSuffix(cfg.OutputFile, ext)
+	out := filepath.Join(cfg.OutputDir, base+"_"+timestamp+ext)
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "output:", err)
