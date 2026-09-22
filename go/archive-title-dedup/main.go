@@ -27,16 +27,9 @@ type Config struct {
 	TableName    string `yaml:"table_name"`
 	InputFile    string `yaml:"input_file"`
 	ItemCategory string `yaml:"item_category"`
-	// CollectionIdentifier, if set, restricts changes to records whose
-	// parent_collection_identifier in the report equals it.
-	CollectionIdentifier string `yaml:"collection_identifier"`
-	// CollectionTableName is used to resolve collection_identifier to its
-	// Collection id so Archive queries can be scoped to it. Required when
-	// collection_identifier is set.
-	CollectionTableName string `yaml:"collection_table_name"`
-	Suffix              string `yaml:"suffix"`
-	Concurrency         int    `yaml:"concurrency"`
-	DryRun              bool   `yaml:"dry_run"`
+	Suffix       string `yaml:"suffix"`
+	Concurrency  int    `yaml:"concurrency"`
+	DryRun       bool   `yaml:"dry_run"`
 	// ChangeLog is a JSON-lines file: every applied title change is appended
 	// to it, and rollback reads it to restore the original titles.
 	ChangeLog string `yaml:"change_log"`
@@ -64,10 +57,8 @@ type Group struct {
 }
 
 type Record struct {
-	Identifier                 string  `json:"identifier"`
-	CollectionID               string  `json:"collection_id"`
-	ItemCategory               string  `json:"item_category"`
-	ParentCollectionIdentifier *string `json:"parent_collection_identifier"`
+	Identifier   string `json:"identifier"`
+	ItemCategory string `json:"item_category"`
 }
 
 type job struct {
@@ -129,15 +120,12 @@ func (c *Config) validateApply() error {
 		return errors.New("item_category is required")
 	case c.Suffix == "":
 		return errors.New("suffix is required")
-	case c.CollectionIdentifier != "" && c.CollectionTableName == "":
-		return errors.New("collection_table_name is required when collection_identifier is set")
 	}
 	return nil
 }
 
 // plan builds the list of title changes: every record in a duplicate group
-// whose item_category (and, if configured, parent_collection_identifier)
-// matches gets "<title><suffix>-<n>", n starting at 1 within the group and
+// whose item_category matches gets "<title><suffix>-<n>", n starting at 1 within the group and
 // zero-padded so titles sort.
 func plan(cfg *Config) ([]job, error) {
 	data, err := os.ReadFile(cfg.InputFile)
@@ -153,10 +141,6 @@ func plan(cfg *Config) ([]job, error) {
 		var matched []Record
 		for _, r := range g.Records {
 			if r.ItemCategory != cfg.ItemCategory {
-				continue
-			}
-			if cfg.CollectionIdentifier != "" &&
-				(r.ParentCollectionIdentifier == nil || *r.ParentCollectionIdentifier != cfg.CollectionIdentifier) {
 				continue
 			}
 			matched = append(matched, r)
@@ -175,66 +159,15 @@ func plan(cfg *Config) ([]job, error) {
 	return jobs, nil
 }
 
-// collectionIDs resolves collection_identifier to the Collection row id(s).
-func collectionIDs(ctx context.Context, db *dynamodb.Client, cfg *Config) ([]string, error) {
-	var ids []string
-	p := dynamodb.NewScanPaginator(db, &dynamodb.ScanInput{
-		TableName:                aws.String(cfg.CollectionTableName),
-		FilterExpression:         aws.String("#i = :i"),
-		ProjectionExpression:     aws.String("#k"),
-		ExpressionAttributeNames: map[string]string{"#i": "identifier", "#k": "id"},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":i": &types.AttributeValueMemberS{Value: cfg.CollectionIdentifier},
-		},
-	})
-	for p.HasMorePages() {
-		page, err := p.NextPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		for _, it := range page.Items {
-			if v, ok := it["id"].(*types.AttributeValueMemberS); ok {
-				ids = append(ids, v.Value)
-			}
-		}
-	}
-	if len(ids) == 0 {
-		return nil, fmt.Errorf("no collection with identifier %q in %s", cfg.CollectionIdentifier, cfg.CollectionTableName)
-	}
-	return ids, nil
-}
-
-// idsByIdentifier scans the Archive table and maps identifier -> id(s), since
-// the table is keyed on id while the report only carries identifiers. When
-// collection_identifier is set the scan is filtered to that collection only:
-// records whose parent_collection contains it, or, for records with no
-// parent_collection, whose collection is it. Nothing outside it is read.
+// idsByIdentifier scans the table once and maps identifier -> id(s), since
+// the table is keyed on id while the report only carries identifiers.
 func idsByIdentifier(ctx context.Context, db *dynamodb.Client, cfg *Config) (map[string][]string, error) {
-	in := &dynamodb.ScanInput{
+	out := map[string][]string{}
+	p := dynamodb.NewScanPaginator(db, &dynamodb.ScanInput{
 		TableName:                aws.String(cfg.TableName),
 		ProjectionExpression:     aws.String("#i, #k"),
 		ExpressionAttributeNames: map[string]string{"#i": "identifier", "#k": "id"},
-	}
-	if cfg.CollectionIdentifier != "" {
-		cids, err := collectionIDs(ctx, db, cfg)
-		if err != nil {
-			return nil, err
-		}
-		in.ExpressionAttributeNames["#c"] = "collection"
-		in.ExpressionAttributeNames["#p"] = "parent_collection"
-		in.ExpressionAttributeValues = map[string]types.AttributeValue{
-			":zero": &types.AttributeValueMemberN{Value: "0"},
-		}
-		var clauses []string
-		for n, id := range cids {
-			ph := fmt.Sprintf(":c%d", n)
-			in.ExpressionAttributeValues[ph] = &types.AttributeValueMemberS{Value: id}
-			clauses = append(clauses, fmt.Sprintf("contains(#p, %s) OR ((attribute_not_exists(#p) OR size(#p) = :zero) AND #c = %s)", ph, ph))
-		}
-		in.FilterExpression = aws.String(strings.Join(clauses, " OR "))
-	}
-	out := map[string][]string{}
-	p := dynamodb.NewScanPaginator(db, in)
+	})
 	for p.HasMorePages() {
 		page, err := p.NextPage(ctx)
 		if err != nil {
@@ -293,7 +226,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "plan:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("table=%s category=%q collection_identifier=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, cfg.CollectionIdentifier, len(jobs), cfg.DryRun)
+	fmt.Printf("table=%s category=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, len(jobs), cfg.DryRun)
 
 	ids, err := idsByIdentifier(ctx, db, cfg)
 	if err != nil {

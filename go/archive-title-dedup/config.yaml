@@ -7,22 +7,11 @@ region: us-east-1
 # Archive table to update.
 table_name: Archive-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
 
-# Collection table, used to resolve collection_identifier to its Collection id
-# so Archive queries can be scoped to it. Required when collection_identifier is set.
-collection_table_name: Collection-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
-
 # Duplicate-titles report (JSON) produced from the table.
 input_file: ~/Desktop/duplicate_titles_dev.json
 
 # Only records whose item_category equals this value are modified.
 item_category: federated
-
-# Optional. Only records whose parent_collection_identifier (as listed in the
-# input report) equals this value are modified. Archive queries are strictly
-# scoped to this collection: only rows whose parent_collection contains it
-# (or, with no parent_collection, whose collection is it) are read.
-# Leave empty for no filtering.
-collection_identifier: FCHS_OBJ
 
 # Text appended to the title. Each modified record then gets "-<index>"
 # after it, where index is 1-based within its duplicate-title group and
@@ -41,7 +30,7 @@ change_log: title-changes.jsonl
 # Restore original titles from change_log instead of applying changes. Also
 # enabled by the -rollback flag. Only rows whose title is still the value this
 # tool set are restored. If change_log does not exist, the original titles are
-# taken from input_file, using the same item_category, collection_identifier and
+# taken from input_file, using the same item_category and
 # suffix settings that were used to apply the changes.
 rollback: false
 
