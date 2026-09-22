@@ -42,7 +42,7 @@ func TestPlanPadsIndex(t *testing.T) {
 	data, _ := json.Marshal(rep)
 	p := filepath.Join(t.TempDir(), "in.json")
 	os.WriteFile(p, data, 0o644)
-	jobs, err := plan(&Config{InputFile: p, ItemCategory: "c", Suffix: " s"}, nil)
+	jobs, err := plan(&Config{InputFile: p, ItemCategory: "c", Suffix: " s"})
 	if err != nil {
 		t.Fatal(err)
 	}

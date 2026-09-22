@@ -30,8 +30,8 @@ type Config struct {
 	// CollectionIdentifier, if set, restricts changes to records whose
 	// parent_collection_identifier in the report equals it.
 	CollectionIdentifier string `yaml:"collection_identifier"`
-	// CollectionTableName is queried for the collection's own identifier when
-	// a record has no parent_collection_identifier. Required when
+	// CollectionTableName is used to resolve collection_identifier to its
+	// Collection id so Archive queries can be scoped to it. Required when
 	// collection_identifier is set.
 	CollectionTableName string `yaml:"collection_table_name"`
 	Suffix              string `yaml:"suffix"`
@@ -136,12 +136,10 @@ func (c *Config) validateApply() error {
 }
 
 // plan builds the list of title changes: every record in a duplicate group
-// whose item_category matches gets "<title><suffix>-<n>", n starting at 1
-// within the group.
-//
-// lookup returns the identifier of the Collection row with the given id; it is
-// used when a record has no parent_collection_identifier.
-func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job, error) {
+// whose item_category (and, if configured, parent_collection_identifier)
+// matches gets "<title><suffix>-<n>", n starting at 1 within the group and
+// zero-padded so titles sort.
+func plan(cfg *Config) ([]job, error) {
 	data, err := os.ReadFile(cfg.InputFile)
 	if err != nil {
 		return nil, err
@@ -157,20 +155,9 @@ func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job,
 			if r.ItemCategory != cfg.ItemCategory {
 				continue
 			}
-			if cfg.CollectionIdentifier != "" {
-				var want string
-				if r.ParentCollectionIdentifier != nil {
-					want = *r.ParentCollectionIdentifier
-				} else if r.CollectionID != "" {
-					id, err := lookup(r.CollectionID)
-					if err != nil {
-						return nil, fmt.Errorf("collection %s (record %s): %w", r.CollectionID, r.Identifier, err)
-					}
-					want = id
-				}
-				if want != cfg.CollectionIdentifier {
-					continue
-				}
+			if cfg.CollectionIdentifier != "" &&
+				(r.ParentCollectionIdentifier == nil || *r.ParentCollectionIdentifier != cfg.CollectionIdentifier) {
+				continue
 			}
 			matched = append(matched, r)
 		}
@@ -188,15 +175,66 @@ func plan(cfg *Config, lookup func(collectionID string) (string, error)) ([]job,
 	return jobs, nil
 }
 
-// idsByIdentifier scans the table once and maps identifier -> id(s), since
-// the table is keyed on id while the report only carries identifiers.
-func idsByIdentifier(ctx context.Context, db *dynamodb.Client, table string) (map[string][]string, error) {
-	out := map[string][]string{}
+// collectionIDs resolves collection_identifier to the Collection row id(s).
+func collectionIDs(ctx context.Context, db *dynamodb.Client, cfg *Config) ([]string, error) {
+	var ids []string
 	p := dynamodb.NewScanPaginator(db, &dynamodb.ScanInput{
-		TableName:                aws.String(table),
+		TableName:                aws.String(cfg.CollectionTableName),
+		FilterExpression:         aws.String("#i = :i"),
+		ProjectionExpression:     aws.String("#k"),
+		ExpressionAttributeNames: map[string]string{"#i": "identifier", "#k": "id"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":i": &types.AttributeValueMemberS{Value: cfg.CollectionIdentifier},
+		},
+	})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range page.Items {
+			if v, ok := it["id"].(*types.AttributeValueMemberS); ok {
+				ids = append(ids, v.Value)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no collection with identifier %q in %s", cfg.CollectionIdentifier, cfg.CollectionTableName)
+	}
+	return ids, nil
+}
+
+// idsByIdentifier scans the Archive table and maps identifier -> id(s), since
+// the table is keyed on id while the report only carries identifiers. When
+// collection_identifier is set the scan is filtered to that collection only:
+// records whose parent_collection contains it, or, for records with no
+// parent_collection, whose collection is it. Nothing outside it is read.
+func idsByIdentifier(ctx context.Context, db *dynamodb.Client, cfg *Config) (map[string][]string, error) {
+	in := &dynamodb.ScanInput{
+		TableName:                aws.String(cfg.TableName),
 		ProjectionExpression:     aws.String("#i, #k"),
 		ExpressionAttributeNames: map[string]string{"#i": "identifier", "#k": "id"},
-	})
+	}
+	if cfg.CollectionIdentifier != "" {
+		cids, err := collectionIDs(ctx, db, cfg)
+		if err != nil {
+			return nil, err
+		}
+		in.ExpressionAttributeNames["#c"] = "collection"
+		in.ExpressionAttributeNames["#p"] = "parent_collection"
+		in.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":zero": &types.AttributeValueMemberN{Value: "0"},
+		}
+		var clauses []string
+		for n, id := range cids {
+			ph := fmt.Sprintf(":c%d", n)
+			in.ExpressionAttributeValues[ph] = &types.AttributeValueMemberS{Value: id}
+			clauses = append(clauses, fmt.Sprintf("contains(#p, %s) OR ((attribute_not_exists(#p) OR size(#p) = :zero) AND #c = %s)", ph, ph))
+		}
+		in.FilterExpression = aws.String(strings.Join(clauses, " OR "))
+	}
+	out := map[string][]string{}
+	p := dynamodb.NewScanPaginator(db, in)
 	for p.HasMorePages() {
 		page, err := p.NextPage(ctx)
 		if err != nil {
@@ -250,16 +288,14 @@ func main() {
 		return
 	}
 
-	lookup := newLookup(ctx, db, cfg)
-
-	jobs, err := plan(cfg, lookup)
+	jobs, err := plan(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan:", err)
 		os.Exit(1)
 	}
 	fmt.Printf("table=%s category=%q collection_identifier=%q planned=%d dry_run=%v\n", cfg.TableName, cfg.ItemCategory, cfg.CollectionIdentifier, len(jobs), cfg.DryRun)
 
-	ids, err := idsByIdentifier(ctx, db, cfg.TableName)
+	ids, err := idsByIdentifier(ctx, db, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scan:", err)
 		os.Exit(1)
@@ -468,43 +504,17 @@ func runRollback(ctx context.Context, db *dynamodb.Client, cfg *Config) bool {
 	return failed.Load() == 0
 }
 
-// newLookup returns a cached resolver from Collection id to its identifier.
-// It is only called while planning, from a single goroutine.
-func newLookup(ctx context.Context, db *dynamodb.Client, cfg *Config) func(string) (string, error) {
-	cache := map[string]string{}
-	return func(collectionID string) (string, error) {
-		if v, ok := cache[collectionID]; ok {
-			return v, nil
-		}
-		out, err := db.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName:                aws.String(cfg.CollectionTableName),
-			Key:                      map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: collectionID}},
-			ProjectionExpression:     aws.String("#i"),
-			ExpressionAttributeNames: map[string]string{"#i": "identifier"},
-		})
-		if err != nil {
-			return "", err
-		}
-		v := ""
-		if s, ok := out.Item["identifier"].(*types.AttributeValueMemberS); ok {
-			v = s.Value
-		}
-		cache[collectionID] = v
-		return v, nil
-	}
-}
-
 // changesFromInput rebuilds the change list from the input report using the
 // same filters and suffix as a normal run, for rollback without a change log.
 func changesFromInput(ctx context.Context, db *dynamodb.Client, cfg *Config) ([]change, error) {
 	if err := cfg.validateApply(); err != nil {
 		return nil, fmt.Errorf("change log not found and cannot fall back to input file: %w", err)
 	}
-	jobs, err := plan(cfg, newLookup(ctx, db, cfg))
+	jobs, err := plan(cfg)
 	if err != nil {
 		return nil, err
 	}
-	ids, err := idsByIdentifier(ctx, db, cfg.TableName)
+	ids, err := idsByIdentifier(ctx, db, cfg)
 	if err != nil {
 		return nil, err
 	}
