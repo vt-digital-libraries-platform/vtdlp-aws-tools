@@ -3,10 +3,10 @@
 Finds Archive records that share an exact title, and disambiguates them by
 appending a suffix and the record's identifier to the title.
 
-Three subcommands:
+Four subcommands:
 
 - `report` — scans the Archive table and writes a JSON report of duplicate
-  titles.
+  titles, plus a Markdown list of the collections that have them.
 - `apply` — reads a report (or change-log) and rewrites titles for one
   collection's records, writing a change-log of what it did.
 - `rollback` — reads a report or change-log and restores the recorded
@@ -39,6 +39,8 @@ collection_table_name: Collection-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
 output_dir: output
 
 # Report file name inside output_dir. Defaults to duplicate_titles.json.
+# `report` inserts a UTC timestamp before the extension
+# (duplicate_titles_<timestamp>.json) and writes a matching .md file.
 output_file: duplicate_titles.json
 
 # Number of parallel scan segments (report) / parallel writers (apply, rollback).
@@ -178,7 +180,7 @@ omitted. `-dry-run` logs the planned changes without writing to DynamoDB.
 
 ```
 archive-title-dedup report -config config.yaml
-# -> output/duplicate_titles_<timestamp>.json
+# -> output/duplicate_titles_<timestamp>.json and .md (collections to work through)
 archive-title-dedup apply -config config.yaml -input output/duplicate_titles_<timestamp>.json \
   -collection_identifier FCHS_OBJ -suffix Map -dry-run
 archive-title-dedup apply -config config.yaml -input output/duplicate_titles_<timestamp>.json \
