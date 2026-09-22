@@ -189,15 +189,34 @@ func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, work
 	return rep, scanned, nil
 }
 
-func main() {
-	cfgPath := flag.String("config", "config.yaml", "path to YAML config")
-	report := flag.Bool("report", false, "scan the table and write the duplicate-titles report")
-	flag.Parse()
+// usage lists the available commands and exits 2, matching the flag
+// package's own convention for a bad invocation.
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: archive-title-dedup <command> [flags]")
+	fmt.Fprintln(os.Stderr, "commands:")
+	fmt.Fprintln(os.Stderr, "  report   scan the table and write the duplicate-titles report")
+	os.Exit(2)
+}
 
-	if !*report {
-		fmt.Fprintln(os.Stderr, "nothing to do: pass -report to scan the table and write the duplicate-titles report")
-		os.Exit(1)
+func main() {
+	if len(os.Args) < 2 {
+		usage()
 	}
+	switch cmd := os.Args[1]; cmd {
+	case "report":
+		runReport(os.Args[2:])
+	case "-h", "-help", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "archive-title-dedup: unknown command %q\n", cmd)
+		usage()
+	}
+}
+
+func runReport(args []string) {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	fs.Parse(args)
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {

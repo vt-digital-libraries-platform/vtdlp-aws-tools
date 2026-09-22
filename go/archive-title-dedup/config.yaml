@@ -1,5 +1,5 @@
 # Configuration for archive-title-dedup.
-# Run with: archive-title-dedup -report -config config.yaml
+# Run with: archive-title-dedup report -config config.yaml
 
 # AWS region the table lives in.
 region: us-east-1
