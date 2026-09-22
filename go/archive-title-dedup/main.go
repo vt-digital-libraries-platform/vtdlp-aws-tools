@@ -21,10 +21,13 @@ import (
 )
 
 type Config struct {
-	Region     string `yaml:"region"`
-	TableName  string `yaml:"table_name"`
-	OutputDir  string `yaml:"output_dir"`
-	OutputFile string `yaml:"output_file"`
+	Region    string `yaml:"region"`
+	TableName string `yaml:"table_name"`
+	// CollectionTableName is used by `report` to resolve each record's
+	// collection id to the collection's identifier. Required for `report`.
+	CollectionTableName string `yaml:"collection_table_name"`
+	OutputDir           string `yaml:"output_dir"`
+	OutputFile          string `yaml:"output_file"`
 	// Concurrency is the number of parallel scan segments (one goroutine each),
 	// and also the number of parallel writers used by apply/rollback.
 	Concurrency int `yaml:"concurrency"`
@@ -51,9 +54,15 @@ type Group struct {
 }
 
 type Record struct {
-	Id               string  `json:"id"`
-	Identifier       string  `json:"identifier"`
-	ParentCollection *string `json:"parent_collection"`
+	Id         string `json:"id"`
+	Identifier string `json:"identifier"`
+	// CollectionID is the record's parent collection's id (DynamoDB key into
+	// the collection table), taken from the Archive item's parent_collection
+	// attribute.
+	CollectionID *string `json:"collection_id"`
+	// CollectionIdentifier is the parent collection's human-readable
+	// identifier, resolved from CollectionID via the collection table.
+	CollectionIdentifier *string `json:"collection_identifier"`
 	// NewTitle is set only in a change-log written by `apply`, recording the
 	// title that was actually written for this record.
 	NewTitle *string `json:"new_title,omitempty"`
@@ -104,6 +113,34 @@ func str(it map[string]types.AttributeValue, name string) (string, bool) {
 	return v.Value, true
 }
 
+// buildCollectionIndex scans the collection table and returns a map of
+// collection id -> collection identifier, used to resolve each record's
+// CollectionID to a CollectionIdentifier.
+func buildCollectionIndex(ctx context.Context, db *dynamodb.Client, table string) (map[string]string, error) {
+	index := map[string]string{}
+	p := dynamodb.NewScanPaginator(db, &dynamodb.ScanInput{
+		TableName:                aws.String(table),
+		ProjectionExpression:     aws.String("#k, #i"),
+		ExpressionAttributeNames: map[string]string{"#k": "id", "#i": "identifier"},
+	})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range page.Items {
+			id, ok := str(it, "id")
+			if !ok {
+				continue
+			}
+			if ident, ok := str(it, "identifier"); ok {
+				index[id] = ident
+			}
+		}
+	}
+	return index, nil
+}
+
 // firstParent returns parent_collection[0], or nil if the attribute is
 // missing or empty.
 func firstParent(it map[string]types.AttributeValue) *string {
@@ -123,7 +160,9 @@ func firstParent(it map[string]types.AttributeValue) *string {
 }
 
 // scanSegment scans one segment of the table into a title -> records map.
-func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, total int) (map[string][]Record, int, error) {
+// collIndex resolves each record's collection id to its collection
+// identifier (see buildCollectionIndex).
+func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, total int, collIndex map[string]string) (map[string][]Record, int, error) {
 	byTitle := map[string][]Record{}
 	scanned := 0
 	in := &dynamodb.ScanInput{
@@ -151,7 +190,14 @@ func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, to
 			}
 			ident, _ := str(it, "identifier")
 			id, _ := str(it, "id")
-			byTitle[title] = append(byTitle[title], Record{Id: id, Identifier: ident, ParentCollection: firstParent(it)})
+			collID := firstParent(it)
+			var collIdent *string
+			if collID != nil {
+				if v, ok := collIndex[*collID]; ok {
+					collIdent = &v
+				}
+			}
+			byTitle[title] = append(byTitle[title], Record{Id: id, Identifier: ident, CollectionID: collID, CollectionIdentifier: collIdent})
 		}
 	}
 	return byTitle, scanned, nil
@@ -159,7 +205,9 @@ func scanSegment(ctx context.Context, db *dynamodb.Client, table string, seg, to
 
 // findDuplicates scans the table with one goroutine per segment and groups
 // records by exact title, keeping only titles that occur more than once.
-func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, workers int) (*Report, int, error) {
+// collIndex resolves each record's collection id to its collection
+// identifier (see buildCollectionIndex).
+func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, workers int, collIndex map[string]string) (*Report, int, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -174,7 +222,7 @@ func findDuplicates(ctx context.Context, db *dynamodb.Client, table string, work
 		wg.Add(1)
 		go func(seg int) {
 			defer wg.Done()
-			part, n, err := scanSegment(ctx, db, table, seg, workers)
+			part, n, err := scanSegment(ctx, db, table, seg, workers, collIndex)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -221,12 +269,15 @@ func loadReport(path string) (*Report, error) {
 }
 
 // Job is a single planned write: set the record identified by Id's title to
-// NewTitle. OldTitle is carried along purely for logging/audit.
+// NewTitle. OldTitle, CollectionID and CollectionIdentifier are carried
+// along purely for logging/audit and for writing the change-log.
 type Job struct {
-	Id         string
-	Identifier string
-	OldTitle   string
-	NewTitle   string
+	Id                   string
+	Identifier           string
+	CollectionID         string
+	CollectionIdentifier string
+	OldTitle             string
+	NewTitle             string
 }
 
 // planApply computes the writes needed to disambiguate every record in rep
@@ -237,14 +288,20 @@ func planApply(rep *Report, collectionIdentifier, suffix string) []Job {
 	var jobs []Job
 	for _, g := range rep.Duplicates {
 		for _, r := range g.Records {
-			if r.ParentCollection == nil || *r.ParentCollection != collectionIdentifier {
+			if r.CollectionIdentifier == nil || *r.CollectionIdentifier != collectionIdentifier {
 				continue
 			}
+			var collID string
+			if r.CollectionID != nil {
+				collID = *r.CollectionID
+			}
 			jobs = append(jobs, Job{
-				Id:         r.Id,
-				Identifier: r.Identifier,
-				OldTitle:   g.Title,
-				NewTitle:   fmt.Sprintf("%s - %s:%s", g.Title, suffix, r.Identifier),
+				Id:                   r.Id,
+				Identifier:           r.Identifier,
+				CollectionID:         collID,
+				CollectionIdentifier: *r.CollectionIdentifier,
+				OldTitle:             g.Title,
+				NewTitle:             fmt.Sprintf("%s - %s:%s", g.Title, suffix, r.Identifier),
 			})
 		}
 	}
@@ -334,11 +391,14 @@ func buildChangeLog(collectionIdentifier string, jobs []Job) *Report {
 		if _, ok := byTitle[j.OldTitle]; !ok {
 			titles = append(titles, j.OldTitle)
 		}
+		collID := j.CollectionID
+		collIdent := j.CollectionIdentifier
 		byTitle[j.OldTitle] = append(byTitle[j.OldTitle], Record{
-			Id:               j.Id,
-			Identifier:       j.Identifier,
-			ParentCollection: &collectionIdentifier,
-			NewTitle:         &newTitle,
+			Id:                   j.Id,
+			Identifier:           j.Identifier,
+			CollectionID:         &collID,
+			CollectionIdentifier: &collIdent,
+			NewTitle:             &newTitle,
 		})
 	}
 	sort.Strings(titles)
@@ -393,6 +453,10 @@ func runReport(args []string) {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
 	}
+	if cfg.CollectionTableName == "" {
+		fmt.Fprintln(os.Stderr, "config: collection_table_name is required")
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
@@ -402,7 +466,13 @@ func runReport(args []string) {
 	}
 	db := dynamodb.NewFromConfig(awsCfg)
 
-	rep, scanned, err := findDuplicates(ctx, db, cfg.TableName, cfg.Concurrency)
+	collIndex, err := buildCollectionIndex(ctx, db, cfg.CollectionTableName)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "scan collection table:", err)
+		os.Exit(1)
+	}
+
+	rep, scanned, err := findDuplicates(ctx, db, cfg.TableName, cfg.Concurrency, collIndex)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scan:", err)
 		os.Exit(1)

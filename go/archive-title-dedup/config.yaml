@@ -7,6 +7,10 @@ region: us-east-1
 # Archive table to scan for records with non-unique titles.
 table_name: Archive-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
 
+# Collection table, used by `report` to resolve each record's parent
+# collection id to the collection's identifier. Required for `report`.
+collection_table_name: Collection-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
+
 # Directory the report is written to (created if missing).
 output_dir: output
 

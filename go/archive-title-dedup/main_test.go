@@ -13,9 +13,9 @@ func TestPlanApply_FiltersByCollectionAndFormatsTitle(t *testing.T) {
 			{
 				Title: "1957 Coeburn Quadrangle Virginia",
 				Records: []Record{
-					{Id: "id-1", Identifier: "nmcst005196", ParentCollection: strp("coll-a")},
-					{Id: "id-2", Identifier: "nmcst005197", ParentCollection: strp("coll-a")},
-					{Id: "id-3", Identifier: "other0001", ParentCollection: strp("coll-b")},
+					{Id: "id-1", Identifier: "nmcst005196", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
+					{Id: "id-2", Identifier: "nmcst005197", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
+					{Id: "id-3", Identifier: "other0001", CollectionID: strp("coll-b-id"), CollectionIdentifier: strp("coll-b")},
 				},
 			},
 		},
@@ -24,8 +24,8 @@ func TestPlanApply_FiltersByCollectionAndFormatsTitle(t *testing.T) {
 	jobs := planApply(rep, "coll-a", "Map")
 
 	want := []Job{
-		{Id: "id-1", Identifier: "nmcst005196", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005196"},
-		{Id: "id-2", Identifier: "nmcst005197", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005197"},
+		{Id: "id-1", Identifier: "nmcst005196", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005196"},
+		{Id: "id-2", Identifier: "nmcst005197", CollectionID: "coll-a-id", CollectionIdentifier: "coll-a", OldTitle: "1957 Coeburn Quadrangle Virginia", NewTitle: "1957 Coeburn Quadrangle Virginia - Map:nmcst005197"},
 	}
 	if !reflect.DeepEqual(jobs, want) {
 		t.Fatalf("planApply() = %+v, want %+v", jobs, want)
@@ -38,8 +38,8 @@ func TestPlanApply_MixedCollectionGroupOnlyIncludesMatchingRecords(t *testing.T)
 			{
 				Title: "American Flag",
 				Records: []Record{
-					{Id: "id-1", Identifier: "fchs_2012_034_001", ParentCollection: strp("coll-a")},
-					{Id: "id-2", Identifier: "sfdst006019", ParentCollection: strp("coll-b")},
+					{Id: "id-1", Identifier: "fchs_2012_034_001", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
+					{Id: "id-2", Identifier: "sfdst006019", CollectionID: strp("coll-b-id"), CollectionIdentifier: strp("coll-b")},
 				},
 			},
 		},
@@ -56,14 +56,14 @@ func TestPlanApply_MixedCollectionGroupOnlyIncludesMatchingRecords(t *testing.T)
 	}
 }
 
-func TestPlanApply_SkipsRecordsWithNoParentCollection(t *testing.T) {
+func TestPlanApply_SkipsRecordsWithNoCollectionIdentifier(t *testing.T) {
 	rep := &Report{
 		Duplicates: []Group{
 			{
 				Title: "Untitled",
 				Records: []Record{
-					{Id: "id-1", Identifier: "no-parent", ParentCollection: nil},
-					{Id: "id-2", Identifier: "has-parent", ParentCollection: strp("coll-a")},
+					{Id: "id-1", Identifier: "no-parent", CollectionID: nil, CollectionIdentifier: nil},
+					{Id: "id-2", Identifier: "has-parent", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
 				},
 			},
 		},
@@ -71,7 +71,7 @@ func TestPlanApply_SkipsRecordsWithNoParentCollection(t *testing.T) {
 
 	jobs := planApply(rep, "coll-a", "Item")
 	if len(jobs) != 1 || jobs[0].Identifier != "has-parent" {
-		t.Fatalf("planApply() = %+v, want only the record with a matching parent_collection", jobs)
+		t.Fatalf("planApply() = %+v, want only the record with a matching collection_identifier", jobs)
 	}
 }
 
@@ -81,7 +81,7 @@ func TestPlanApply_IsIdempotent(t *testing.T) {
 			{
 				Title: "1957 Coeburn Quadrangle Virginia",
 				Records: []Record{
-					{Id: "id-1", Identifier: "nmcst005196", ParentCollection: strp("coll-a")},
+					{Id: "id-1", Identifier: "nmcst005196", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
 				},
 			},
 		},
@@ -104,13 +104,13 @@ func TestPlanRollback_RestoresRecordedOriginalRegardlessOfCollection(t *testing.
 			{
 				Title: "1957 Coeburn Quadrangle Virginia",
 				Records: []Record{
-					{Id: "id-1", Identifier: "nmcst005196", ParentCollection: strp("coll-a"), NewTitle: &newTitleA},
+					{Id: "id-1", Identifier: "nmcst005196", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a"), NewTitle: &newTitleA},
 				},
 			},
 			{
 				Title: "American Flag",
 				Records: []Record{
-					{Id: "id-2", Identifier: "sfdst006019", ParentCollection: strp("coll-b"), NewTitle: &newTitleB},
+					{Id: "id-2", Identifier: "sfdst006019", CollectionID: strp("coll-b-id"), CollectionIdentifier: strp("coll-b"), NewTitle: &newTitleB},
 				},
 			},
 		},
@@ -133,7 +133,7 @@ func TestPlanRollback_WorksOnAPlainReportWithNoNewTitle(t *testing.T) {
 			{
 				Title: "1957 Coeburn Quadrangle Virginia",
 				Records: []Record{
-					{Id: "id-1", Identifier: "nmcst005196", ParentCollection: strp("coll-a")},
+					{Id: "id-1", Identifier: "nmcst005196", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
 				},
 			},
 		},
