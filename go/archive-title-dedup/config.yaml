@@ -1,38 +1,17 @@
 # Configuration for archive-title-dedup.
-# Run with: archive-title-dedup -config config.yaml [-dry-run]
+# Run with: archive-title-dedup -config config.yaml
 
 # AWS region the table lives in.
 region: us-east-1
 
-# Archive table to update.
+# Archive table to scan for records with non-unique titles.
 table_name: Archive-bxbkjhe235e3jcwcjcji5txvlm-vtdlpdev
 
-# Duplicate-titles report (JSON) produced from the table.
-input_file: ~/Desktop/duplicate_titles_dev.json
+# Directory the report is written to (created if missing).
+output_dir: output
 
-# Only records whose item_category equals this value are modified.
-item_category: federated
+# Report file name inside output_dir. Defaults to duplicate_titles.json.
+output_file: duplicate_titles.json
 
-# Text appended to the title. Each modified record then gets "-<index>"
-# after it, where index is 1-based within its duplicate-title group and
-# zero-padded to the width of the group's largest index so titles sort
-# correctly (1-9 records: -1, 10-99: -01, 100-999: -001, ...).
-# Example: title "Foo", suffix " dup", -> "Foo dup-1", "Foo dup-2", ...
-suffix: ": Sample"
-
-# Number of concurrent worker goroutines.
+# Number of parallel scan segments; each is scanned by its own goroutine.
 concurrency: 10
-
-# File where every applied change (id, old and new title) is appended, one JSON
-# object per line. Rollback reads it. Defaults to title-changes.jsonl.
-change_log: title-changes.jsonl
-
-# Restore original titles from change_log instead of applying changes. Also
-# enabled by the -rollback flag. Only rows whose title is still the value this
-# tool set are restored. If change_log does not exist, the original titles are
-# taken from input_file, using the same item_category and
-# suffix settings that were used to apply the changes.
-rollback: false
-
-# Report planned changes without writing. Also forced by the -dry-run flag.
-dry_run: false
