@@ -309,14 +309,19 @@ func planApply(rep *Report, collectionIdentifier, suffix string) []Job {
 	return jobs
 }
 
-// planRollback computes the writes needed to restore every record in rep to
-// its recorded title (g.Title), regardless of the record's current live
-// value in DynamoDB. rep may be an original report or a change-log written
-// by apply; both share this shape.
-func planRollback(rep *Report) []Job {
+// planRollback computes the writes needed to restore every record in rep
+// belonging to collectionIdentifier to its recorded title (g.Title),
+// regardless of the record's current live value in DynamoDB. Records in
+// other collections are left untouched, including other members of a
+// title-group that spans multiple collections. rep may be an original
+// report or a change-log written by apply; both share this shape.
+func planRollback(rep *Report, collectionIdentifier string) []Job {
 	var jobs []Job
 	for _, g := range rep.Duplicates {
 		for _, r := range g.Records {
+			if r.CollectionIdentifier == nil || *r.CollectionIdentifier != collectionIdentifier {
+				continue
+			}
 			old := ""
 			if r.NewTitle != nil {
 				old = *r.NewTitle
@@ -588,11 +593,12 @@ func runApply(args []string) {
 func runRollback(args []string) {
 	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
 	cfgPath := fs.String("config", "config.yaml", "path to YAML config")
+	collectionIdentifier := fs.String("collection_identifier", "", "collection to revert (falls back to config.yaml)")
 	dryRun := fs.Bool("dry-run", false, "log planned changes without writing to DynamoDB")
 	fs.Parse(args)
 
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: archive-title-dedup rollback [-config config.yaml] [-dry-run] <report-or-changelog.json>")
+		fmt.Fprintln(os.Stderr, "usage: archive-title-dedup rollback [-config config.yaml] [-collection_identifier id] [-dry-run] <report-or-changelog.json>")
 		os.Exit(2)
 	}
 	inputPath := fs.Arg(0)
@@ -603,15 +609,24 @@ func runRollback(args []string) {
 		os.Exit(1)
 	}
 
+	collID := *collectionIdentifier
+	if collID == "" {
+		collID = cfg.CollectionIdentifier
+	}
+	if collID == "" {
+		fmt.Fprintln(os.Stderr, "rollback: -collection_identifier is required (flag or config.yaml)")
+		os.Exit(2)
+	}
+
 	rep, err := loadReport(inputPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "input:", err)
 		os.Exit(1)
 	}
 
-	jobs := planRollback(rep)
+	jobs := planRollback(rep, collID)
 	if len(jobs) == 0 {
-		fmt.Printf("no records found in %s\n", inputPath)
+		fmt.Printf("no records found for collection %s in %s\n", collID, inputPath)
 		return
 	}
 

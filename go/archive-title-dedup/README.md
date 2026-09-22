@@ -129,14 +129,20 @@ Keep this file — it's what `rollback` uses to undo the change.
 ### rollback
 
 ```
-archive-title-dedup rollback -config config.yaml [-dry-run] <report-or-changelog.json>
+archive-title-dedup rollback -config config.yaml \
+  -collection_identifier FCHS_OBJ \
+  [-dry-run] <report-or-changelog.json>
 ```
 
-Restores every record in the given file to its recorded original title
+For every record in the given file whose `collection_identifier` matches
+`-collection_identifier`, restores its title to the recorded original
 (`duplicates[].title`), regardless of the record's current live value in
-DynamoDB. Accepts either an original `report` file or a change-log written
-by `apply` — both share the same JSON shape. `-dry-run` logs the planned
-changes without writing to DynamoDB.
+DynamoDB. Records belonging to other collections are left untouched, just
+like `apply`. Accepts either an original `report` file or a change-log
+written by `apply` — both share the same JSON shape.
+`-collection_identifier` falls back to `collection_identifier` in
+`config.yaml` when omitted. `-dry-run` logs the planned changes without
+writing to DynamoDB.
 
 ## Typical workflow
 
@@ -147,5 +153,6 @@ archive-title-dedup apply -config config.yaml -input output/duplicate_titles.jso
 archive-title-dedup apply -config config.yaml -input output/duplicate_titles.json \
   -collection_identifier FCHS_OBJ -suffix Map
 # ... if something needs undoing:
-archive-title-dedup rollback -config config.yaml output/changelog_FCHS_OBJ_<timestamp>.json
+archive-title-dedup rollback -config config.yaml -collection_identifier FCHS_OBJ \
+  output/changelog_FCHS_OBJ_<timestamp>.json
 ```

@@ -94,7 +94,7 @@ func TestPlanApply_IsIdempotent(t *testing.T) {
 	}
 }
 
-func TestPlanRollback_RestoresRecordedOriginalRegardlessOfCollection(t *testing.T) {
+func TestPlanRollback_RestoresRecordedOriginalOnlyForMatchingCollection(t *testing.T) {
 	newTitleA := "1957 Coeburn Quadrangle Virginia - Map:nmcst005196"
 	newTitleB := "American Flag - Photo:sfdst006019"
 	rep := &Report{
@@ -116,14 +116,20 @@ func TestPlanRollback_RestoresRecordedOriginalRegardlessOfCollection(t *testing.
 		},
 	}
 
-	jobs := planRollback(rep)
-
-	want := []Job{
+	jobsA := planRollback(rep, "coll-a")
+	wantA := []Job{
 		{Id: "id-1", Identifier: "nmcst005196", OldTitle: newTitleA, NewTitle: "1957 Coeburn Quadrangle Virginia"},
+	}
+	if !reflect.DeepEqual(jobsA, wantA) {
+		t.Fatalf("planRollback(coll-a) = %+v, want %+v", jobsA, wantA)
+	}
+
+	jobsB := planRollback(rep, "coll-b")
+	wantB := []Job{
 		{Id: "id-2", Identifier: "sfdst006019", OldTitle: newTitleB, NewTitle: "American Flag"},
 	}
-	if !reflect.DeepEqual(jobs, want) {
-		t.Fatalf("planRollback() = %+v, want %+v", jobs, want)
+	if !reflect.DeepEqual(jobsB, wantB) {
+		t.Fatalf("planRollback(coll-b) = %+v, want %+v", jobsB, wantB)
 	}
 }
 
@@ -139,11 +145,30 @@ func TestPlanRollback_WorksOnAPlainReportWithNoNewTitle(t *testing.T) {
 		},
 	}
 
-	jobs := planRollback(rep)
+	jobs := planRollback(rep, "coll-a")
 	want := []Job{
 		{Id: "id-1", Identifier: "nmcst005196", OldTitle: "", NewTitle: "1957 Coeburn Quadrangle Virginia"},
 	}
 	if !reflect.DeepEqual(jobs, want) {
 		t.Fatalf("planRollback() = %+v, want %+v", jobs, want)
+	}
+}
+
+func TestPlanRollback_SkipsRecordsWithNoCollectionIdentifier(t *testing.T) {
+	rep := &Report{
+		Duplicates: []Group{
+			{
+				Title: "Untitled",
+				Records: []Record{
+					{Id: "id-1", Identifier: "no-parent", CollectionID: nil, CollectionIdentifier: nil},
+					{Id: "id-2", Identifier: "has-parent", CollectionID: strp("coll-a-id"), CollectionIdentifier: strp("coll-a")},
+				},
+			},
+		},
+	}
+
+	jobs := planRollback(rep, "coll-a")
+	if len(jobs) != 1 || jobs[0].Identifier != "has-parent" {
+		t.Fatalf("planRollback() = %+v, want only the record with a matching collection_identifier", jobs)
 	}
 }
