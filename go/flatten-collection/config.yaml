@@ -6,7 +6,7 @@
 collection_identifier: glink
 
 # Backup root: the directory holding the <identifier>/ directories.
-root_path: ~/dev/dlp/assets/{collection_identifier}/media
+root_path: ~/dev/dlp/assets/{collection_identifier}
 
 # Directory inside each <identifier>/ that holds the files.
 subdir: Access
