@@ -1,0 +1,29 @@
+# Configuration for flatten-collection.
+# Run with: flatten-collection flatten -config config.yaml
+
+# Collection whose backup is flattened/expanded. Substituted for
+# {collection_identifier} in root_path. Overridable with -collection_identifier.
+collection_identifier: glink
+
+# Backup root: the directory holding the <identifier>/ directories.
+root_path: ~/dev/dlp/assets/{collection_identifier}/media
+
+# Directory inside each <identifier>/ that holds the files.
+subdir: Access
+
+# File extensions (case-insensitive) that are moved.
+extensions:
+  - .tif
+
+# Number of goroutines moving files in parallel.
+concurrency: 16
+
+# Written into root_path by flatten so expand can restore each file to its
+# exact original location. Removed by expand once every file is restored.
+manifest_file: flatten_manifest.json
+
+# Used by expand only for files not in the manifest. Matched against the file
+# name without its extension; the first capture group is the <identifier>
+# directory. Here, glink001001003 -> glink001001. Leave empty to use the
+# whole name (<identifier>.tif -> <identifier>/Access/<identifier>.tif).
+identifier_pattern: '^(.+)\d{3}$'
